@@ -79,8 +79,10 @@ impl CoreMLBatchModelWithState {
             }
             CoreMLModelLoader::Buffer(vec) => {
                 let mut coreml_model = CoreMLBatchModel::load_buffer(vec.clone(), info.clone());
-                coreml_model.model.load();
-                if coreml_model.model.failed() {
+                // `load()` reports whether the model actually made it into
+                // memory; `failed()` only reports a failure to build the asset.
+                let loaded = coreml_model.model.load();
+                if !loaded || coreml_model.model.failed() {
                     return Err(CoreMLError::FailedToLoadBatchStatic(
                         "Failed to load model; likely not a CoreML mlmodel file",
                         Self::Unloaded(info, CoreMLModelLoader::Buffer(vec)),
@@ -240,17 +242,19 @@ impl CoreMLBatchModel {
         coreml_model
     }
 
-    pub fn load_buffer(mut buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
+    /// See [`crate::mlmodel::CoreMLModel::load_buffer`] for why the buffer is
+    /// handed over as a boxed slice rather than a `Vec`.
+    pub fn load_buffer(buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
+        let mut buf = buf.into_boxed_slice();
+        let len = buf.len();
+        let ptr = buf.as_mut_ptr();
+        // Ownership passes to the Swift `Data`, which frees it exactly once.
+        std::mem::forget(buf);
         let coreml_model = Self {
-            model: modelWithAssetsBatch(
-                buf.as_mut_ptr(),
-                buf.len() as isize,
-                info.opts.compute_platform,
-            ),
+            model: modelWithAssetsBatch(ptr, len as isize, info.opts.compute_platform),
             // save_path: None,
             outputs: Default::default(),
         };
-        std::mem::forget(buf);
         coreml_model
     }
 

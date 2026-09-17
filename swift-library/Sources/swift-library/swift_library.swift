@@ -42,6 +42,10 @@ class BatchModel: @unchecked Sendable {
 	var compiledPath: URL? = nil
 	var model: MLModel? = nil
 	var modelCompiledAsset: MLModelAsset? = nil
+	// Backing store for `modelCompiledAsset`. `MLModelAsset(specification:)` does
+	// not take ownership of the `Data`, and the model is loaded from the asset
+	// lazily and asynchronously, so the buffer has to outlive both.
+	var specificationData: Data? = nil
 	var inputs: [BatchModelInput] = []
 	var computeUnits: MLComputeUnits = .cpuAndNeuralEngine
 	var failedToLoad: Bool
@@ -67,14 +71,19 @@ class BatchModel: @unchecked Sendable {
 		do {
 			if self.compiledPath == nil {
 				let semaphore = DispatchSemaphore(value: 0)
+				// `Task` swallows a thrown error, so signalling only on the happy
+				// path strands `wait()` forever whenever the load fails.
 				Task { [weak self] in
-					guard let self else { return }
-					let asset = self.modelCompiledAsset!
-					let res = try await MLModel.load(asset: asset, configuration: config)
-					self.model = res
-					semaphore.signal()
+					defer { semaphore.signal() }
+					guard let self, let asset = self.modelCompiledAsset else { return }
+					do {
+						self.model = try await MLModel.load(asset: asset, configuration: config)
+					} catch {
+						print("Failed to load model from asset: \(error)")
+					}
 				}
 				semaphore.wait()
+				return self.model != nil
 			} else {
 				let loadedModel = try MLModel(contentsOf: self.compiledPath!, configuration: config)
 				self.model = loadedModel
@@ -330,6 +339,7 @@ func initWithCompiledAsset(
 		})
 	do {
 		let m = Model.init(failedToLoad: false)
+		m.specificationData = data
 		m.modelCompiledAsset = try MLModelAsset.init(specification: data)
 		m.computeUnits = computeUnits
 		return m
@@ -361,6 +371,7 @@ func initWithCompiledAssetBatch(
 		})
 	do {
 		let m = BatchModel.init(failedToLoad: false)
+		m.specificationData = data
 		m.modelCompiledAsset = try MLModelAsset.init(specification: data)
 		m.computeUnits = computeUnits
 		return m
@@ -461,6 +472,10 @@ struct RuntimeError: LocalizedError {
 class Model: @unchecked Sendable {
 	var compiledPath: URL? = nil
 	var modelCompiledAsset: MLModelAsset? = nil
+	// Backing store for `modelCompiledAsset`. `MLModelAsset(specification:)` does
+	// not take ownership of the `Data`, and the model is loaded from the asset
+	// lazily and asynchronously, so the buffer has to outlive both.
+	var specificationData: Data? = nil
 	var model: MLModel? = nil
 	var dict: [String: Any] = [:]
 	var outputs: [String: Any] = [:]
@@ -486,14 +501,19 @@ class Model: @unchecked Sendable {
 		do {
 			if self.compiledPath == nil {
 				let semaphore = DispatchSemaphore(value: 0)
+				// `Task` swallows a thrown error, so signalling only on the happy
+				// path strands `wait()` forever whenever the load fails.
 				Task { [weak self] in
-					guard let self else { return }
-					let asset = self.modelCompiledAsset!
-					let res = try await MLModel.load(asset: asset, configuration: config)
-					self.model = res
-					semaphore.signal()
+					defer { semaphore.signal() }
+					guard let self, let asset = self.modelCompiledAsset else { return }
+					do {
+						self.model = try await MLModel.load(asset: asset, configuration: config)
+					} catch {
+						print("Failed to load model from asset: \(error)")
+					}
 				}
 				semaphore.wait()
+				return self.model != nil
 			} else {
 				let loadedModel = try MLModel(contentsOf: self.compiledPath!, configuration: config)
 				self.model = loadedModel

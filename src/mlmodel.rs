@@ -137,8 +137,12 @@ impl CoreMLModelWithState {
             }
             CoreMLModelLoader::Buffer(vec) => {
                 let mut coreml_model = CoreMLModel::load_buffer(vec.clone(), info.clone());
-                coreml_model.model.load();
-                if coreml_model.model.failed() {
+                // `load()` reports whether the model actually made it into
+                // memory; `failed()` only reports a failure to build the asset.
+                // Checking just the latter leaves a `Loaded` state wrapping a
+                // nil `MLModel`, which traps on the first prediction.
+                let loaded = coreml_model.model.load();
+                if !loaded || coreml_model.model.failed() {
                     return Err(CoreMLError::FailedToLoadStatic(
                         "Failed to load model; likely not a CoreML mlmodel file",
                         Self::Unloaded(info, CoreMLModelLoader::Buffer(vec)),
@@ -300,17 +304,25 @@ impl CoreMLModel {
         coreml_model
     }
 
-    pub fn load_buffer(mut buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
-        let coreml_model = Self {
-            model: modelWithAssets(
-                buf.as_mut_ptr(),
-                buf.len() as isize,
-                info.opts.compute_platform,
-            ),
-            outputs: Default::default(),
-        };
+    /// Hands ownership of `buf` to the Swift side, which wraps it in a
+    /// `Data(bytesNoCopy:)` whose deallocator reclaims it via
+    /// `rust_vec_free_u8(ptr, len)` -- i.e. `Vec::from_raw_parts(ptr, len, len)`.
+    ///
+    /// That reconstruction uses `len` as the capacity, so the allocation handed
+    /// over must have `capacity == len` or it is freed under a layout it was
+    /// never allocated with. `Vec` gives no such guarantee (an AES-GCM decrypt,
+    /// for instance, yields `capacity == len + 16`), so convert to a boxed
+    /// slice, which does.
+    pub fn load_buffer(buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
+        let mut buf = buf.into_boxed_slice();
+        let len = buf.len();
+        let ptr = buf.as_mut_ptr();
+        // Ownership passes to the Swift `Data`, which frees it exactly once.
         std::mem::forget(buf);
-        coreml_model
+        Self {
+            model: modelWithAssets(ptr, len as isize, info.opts.compute_platform),
+            outputs: Default::default(),
+        }
     }
 
     pub fn add_input(

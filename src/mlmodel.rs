@@ -137,8 +137,12 @@ impl CoreMLModelWithState {
             }
             CoreMLModelLoader::Buffer(vec) => {
                 let mut coreml_model = CoreMLModel::load_buffer(vec.clone(), info.clone());
-                coreml_model.model.load();
-                if coreml_model.model.failed() {
+                // `load()` reports whether the model actually made it into
+                // memory; `failed()` only reports a failure to build the asset.
+                // Checking just the latter leaves a `Loaded` state wrapping a
+                // nil `MLModel`, which traps on the first prediction.
+                let loaded = coreml_model.model.load();
+                if !loaded || coreml_model.model.failed() {
                     return Err(CoreMLError::FailedToLoadStatic(
                         "Failed to load model; likely not a CoreML mlmodel file",
                         Self::Unloaded(info, CoreMLModelLoader::Buffer(vec)),
@@ -159,7 +163,13 @@ impl CoreMLModelWithState {
                     }) {
                     Ok(vec) => {
                         let mut coreml_model = CoreMLModel::load_buffer(vec, info.clone());
-                        coreml_model.model.load();
+                        let loaded = coreml_model.model.load();
+                        if !loaded || coreml_model.model.failed() {
+                            return Err(CoreMLError::FailedToLoadStatic(
+                                "Failed to load model from cached buffer",
+                                Self::Unloaded(info, CoreMLModelLoader::BufferToDisk(u)),
+                            ));
+                        }
                         let loader = CoreMLModelLoader::BufferToDisk(u);
                         Ok(Self::Loaded(coreml_model, info, loader))
                     }
@@ -300,17 +310,14 @@ impl CoreMLModel {
         coreml_model
     }
 
-    pub fn load_buffer(mut buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
-        let coreml_model = Self {
-            model: modelWithAssets(
-                buf.as_mut_ptr(),
-                buf.len() as isize,
-                info.opts.compute_platform,
-            ),
+    /// Transfers a boxed slice to Swift's `Data(bytesNoCopy:)`. Its custom
+    /// deallocator reconstructs the same boxed slice after `Data` is released.
+    pub fn load_buffer(buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
+        let (ptr, len) = crate::swift::into_raw_boxed_slice(buf);
+        Self {
+            model: modelWithAssets(ptr, len as isize, info.opts.compute_platform),
             outputs: Default::default(),
-        };
-        std::mem::forget(buf);
-        coreml_model
+        }
     }
 
     pub fn add_input(

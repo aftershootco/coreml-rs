@@ -185,8 +185,16 @@ fn rust_vec_free_u16(ptr: *mut u16, len: usize) {
 
 fn rust_vec_free_u8(ptr: *mut u8, len: usize) {
     unsafe {
-        _ = Vec::from_raw_parts(ptr, len, len);
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
     }
+}
+
+/// Transfers a byte buffer to code that will return it through
+/// [`rust_vec_free_u8`].
+pub(crate) fn into_raw_boxed_slice(buf: Vec<u8>) -> (*mut u8, usize) {
+    let buf = buf.into_boxed_slice();
+    let len = buf.len();
+    (Box::into_raw(buf) as *mut u8, len)
 }
 
 fn rust_vec_free_i32(ptr: *mut i32, len: usize) {

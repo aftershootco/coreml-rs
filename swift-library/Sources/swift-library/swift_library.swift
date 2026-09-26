@@ -385,9 +385,9 @@ func initWithPath(path: RustString, compute: ComputePlatform, compiled: Bool) ->
 	}
 	var compiledPath: URL
 	if compiled {
-		compiledPath = URL(string: path.toString())!
+		compiledPath = fileURL(path.toString())
 	} else {
-		let url = URL(string: path.toString())!
+		let url = fileURL(path.toString())
 		do {
 			compiledPath = try MLModel.compileModel(at: url)
 		} catch {
@@ -398,6 +398,41 @@ func initWithPath(path: RustString, compute: ComputePlatform, compiled: Bool) ->
 	m.compiledPath = compiledPath
 	m.computeUnits = computeUnits
 	return m
+}
+
+// Accepts both `file://` URL strings (what `getCompiledPath` hands back) and plain
+// filesystem paths. `URL(string:)` returns nil for plain paths containing spaces.
+func fileURL(_ path: String) -> URL {
+	if path.hasPrefix("file:"), let url = URL(string: path) {
+		return url
+	}
+	return URL(fileURLWithPath: path)
+}
+
+// Compiles the model package at `model` and moves the resulting `.mlmodelc` to `to`,
+// replacing anything already there. The compiled model is staged next to `to` first so
+// the final rename is on the same volume and a crash never leaves a half-moved model.
+// Returns nil on success, otherwise a description of the failure.
+func compileModelTo(model: RustString, to: RustString) -> RustString? {
+	let source = fileURL(model.toString())
+	let destination = fileURL(to.toString())
+	let fileManager = FileManager.default
+	let parent = destination.deletingLastPathComponent()
+	let staging = parent.appendingPathComponent(
+		".\(destination.lastPathComponent).staging-\(UUID().uuidString)")
+	do {
+		let compiled = try MLModel.compileModel(at: source)
+		try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+		try fileManager.moveItem(at: compiled, to: staging)
+		if fileManager.fileExists(atPath: destination.path) {
+			try fileManager.removeItem(at: destination)
+		}
+		try fileManager.moveItem(at: staging, to: destination)
+		return nil
+	} catch {
+		try? fileManager.removeItem(at: staging)
+		return "\(error)".intoRustString()
+	}
 }
 
 // Compile model and overwrite the file to the permanent location, replacing it if necessary

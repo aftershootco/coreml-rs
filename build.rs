@@ -53,6 +53,10 @@ fn compile_swift() {
 
     cmd.current_dir(swift_package_dir)
         .arg("build")
+        // SwiftPM 6.4 defaults to the swiftbuild engine, which points `.build/release` at
+        // `.build/out/Products/Release` without the static lib; the native engine keeps
+        // the layout `swift_library_static_lib_dir()` expects.
+        .args(&["--build-system", "native"])
         .args(&["--arch", &arch])
         .args(&["-Xswiftc", "-static"])
         .args(&[

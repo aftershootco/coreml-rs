@@ -47,16 +47,18 @@ fn compile_swift() {
 
     let triple = std::env::var("TARGET").unwrap();
     let parts = triple.split("-").collect::<Vec<_>>();
-    let arch = parts.first().clone().unwrap();
+    // SwiftPM takes Apple's arch names. The native build system also accepted Rust's
+    // `aarch64`, but swiftbuild (the default from SwiftPM 6.4) skips an arch it does not
+    // know and reports a successful build with nothing built.
+    let arch = match *parts.first().unwrap() {
+        "aarch64" => "arm64",
+        arch => arch,
+    };
 
     let mut cmd = Command::new("swift");
 
     cmd.current_dir(swift_package_dir)
         .arg("build")
-        // SwiftPM 6.4 defaults to the swiftbuild engine, which points `.build/release` at
-        // `.build/out/Products/Release` without the static lib; the native engine keeps
-        // the layout `swift_library_static_lib_dir()` expects.
-        .args(&["--build-system", "native"])
         .args(&["--arch", &arch])
         .args(&["-Xswiftc", "-static"])
         .args(&[

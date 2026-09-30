@@ -6,6 +6,7 @@ fn main() {
     let bridge_files = vec!["src/swift.rs"];
     swift_bridge_build::parse_bridges(bridge_files)
         .write_all_concatenated(swift_bridge_out_dir(), "rust-calls-swift");
+    export_bridge_functions();
 
     // 2. Compile Swift library
     compile_swift();
@@ -40,6 +41,38 @@ fn main() {
         &xcode_path
     );
     println!("cargo:rustc-link-search={}", "/usr/lib/swift");
+}
+
+/// Make the generated `@_cdecl` glue `public`.
+///
+/// swift-bridge emits it as internal `func`, which swiftc -O gives hidden visibility.
+/// swiftbuild (SwiftPM 6.4's default) merges the objects with `ld -r` before archiving,
+/// and that turns hidden symbols into locals, so the final link fails with undefined
+/// `___swift_bridge__$...`. Public keeps them default visibility through the merge; the
+/// native build system archives the objects as they are, so it is unaffected either way.
+fn export_bridge_functions() {
+    let path = generated_code_dir()
+        .join("rust-calls-swift")
+        .join("rust-calls-swift.swift");
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        eprintln!("Failed to read {}: {}", path.display(), e);
+        std::process::exit(1);
+    });
+
+    let mut out = String::with_capacity(source.len());
+    let mut after_cdecl = false;
+    for line in source.split_inclusive('\n') {
+        if after_cdecl && line.starts_with("func ") {
+            out.push_str("public ");
+        }
+        after_cdecl = line.starts_with("@_cdecl(");
+        out.push_str(line);
+    }
+
+    std::fs::write(&path, out).unwrap_or_else(|e| {
+        eprintln!("Failed to write {}: {}", path.display(), e);
+        std::process::exit(1);
+    });
 }
 
 fn compile_swift() {

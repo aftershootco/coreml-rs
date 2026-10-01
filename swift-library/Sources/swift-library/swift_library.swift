@@ -411,7 +411,8 @@ func fileURL(_ path: String) -> URL {
 
 // Compiles the model package at `model` and moves the resulting `.mlmodelc` to `to`,
 // replacing anything already there. The compiled model is staged next to `to` first so
-// the final rename is on the same volume and a crash never leaves a half-moved model.
+// the final swap is on the same volume, and `replaceItemAt` swaps it in atomically so an
+// existing model at `to` is never deleted before its replacement is in place.
 // Returns nil on success, otherwise a description of the failure.
 func compileModelTo(model: RustString, to: RustString) -> RustString? {
 	let source = fileURL(model.toString())
@@ -420,19 +421,33 @@ func compileModelTo(model: RustString, to: RustString) -> RustString? {
 	let parent = destination.deletingLastPathComponent()
 	let staging = parent.appendingPathComponent(
 		".\(destination.lastPathComponent).staging-\(UUID().uuidString)")
+	let start = DispatchTime.now()
 	do {
 		let compiled = try MLModel.compileModel(at: source)
+		logStderr("compiled \(source.path) in \(elapsedMs(since: start))ms")
 		try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
 		try fileManager.moveItem(at: compiled, to: staging)
 		if fileManager.fileExists(atPath: destination.path) {
-			try fileManager.removeItem(at: destination)
+			_ = try fileManager.replaceItemAt(destination, withItemAt: staging)
+		} else {
+			try fileManager.moveItem(at: staging, to: destination)
 		}
-		try fileManager.moveItem(at: staging, to: destination)
+		logStderr("persisted compiled model to \(destination.path) in \(elapsedMs(since: start))ms total")
 		return nil
 	} catch {
 		try? fileManager.removeItem(at: staging)
+		logStderr("failed to compile \(source.path) to \(destination.path) after \(elapsedMs(since: start))ms: \(error)")
 		return "\(error)".intoRustString()
 	}
+}
+
+func elapsedMs(since start: DispatchTime) -> UInt64 {
+	return (DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+}
+
+// stderr is captured into the host app's main.log.
+func logStderr(_ message: String) {
+	FileHandle.standardError.write(Data("[coreml-rs] \(message)\n".utf8))
 }
 
 // Compile model and overwrite the file to the permanent location, replacing it if necessary
@@ -466,9 +481,9 @@ func initWithPathBatch(path: RustString, compute: ComputePlatform, compiled: Boo
 	}
 	var compiledPath: URL
 	if compiled {
-		compiledPath = URL(string: path.toString())!
+		compiledPath = fileURL(path.toString())
 	} else {
-		let url = URL(string: path.toString())!
+		let url = fileURL(path.toString())
 		do {
 			compiledPath = try MLModel.compileModel(at: url)
 		} catch {

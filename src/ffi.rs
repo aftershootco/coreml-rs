@@ -785,7 +785,7 @@ impl BatchModel {
         if self.model.is_some() {
             return true;
         }
-        let config = batch_model_configuration(self.compute_units);
+        let config = model_configuration(self.compute_units);
         if let Some(path) = &self.compiled_path {
             let url = file_url(path);
             return match unsafe {
@@ -1081,22 +1081,15 @@ fn unique_sibling(path: &Path, tag: &str) -> PathBuf {
     path.with_file_name(format!(".{name}.{tag}-{}-{nanos}", std::process::id()))
 }
 
+/// Builds the configuration used for every model load.
+///
+/// The historical `experimentalMLE5EngineUsage` KVC switch is deliberately not
+/// set: it trades a ~4x slower model load for a faster prediction engine, and
+/// the single-model path never used it. If a workload wants that trade, set the
+/// key here again.
 fn model_configuration(compute_units: MLComputeUnits) -> Retained<MLModelConfiguration> {
     let config = unsafe { MLModelConfiguration::new() };
     unsafe { config.setComputeUnits(compute_units) };
-    config
-}
-
-/// The batch path keeps the historical workaround that opts out of CoreML's
-/// experimental MLE5 engine. The single-model path never set it, and doing so
-/// slows model loading by more than 4x, so it must stay batch-only.
-fn batch_model_configuration(compute_units: MLComputeUnits) -> Retained<MLModelConfiguration> {
-    let config = model_configuration(compute_units);
-    unsafe {
-        let key = NSString::from_str("experimentalMLE5EngineUsage");
-        let value = NSNumber::new_isize(1);
-        let _: () = msg_send![&*config, setValue: &*value, forKey: &*key];
-    }
     config
 }
 

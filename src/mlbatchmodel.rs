@@ -2,7 +2,7 @@ use crate::{
     ffi::{modelWithAssetsBatch, modelWithPathBatch, BatchModel},
     mlarray::MLArray,
     mlmodel::{CoreMLError, CoreMLModelInfo, CoreMLModelLoader},
-    swift::MLBatchModelOutput,
+    ffi::MLBatchModelOutput,
     CoreMLModelOptions,
 };
 use flate2::Compression;
@@ -14,7 +14,7 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
-pub use crate::swift::MLModelOutput;
+pub use crate::ffi::MLModelOutput;
 
 #[derive(Debug)]
 pub enum CoreMLBatchModelWithState {
@@ -91,12 +91,12 @@ impl CoreMLBatchModelWithState {
             }
             CoreMLModelLoader::BufferToDisk(u) => {
                 match std::fs::File::open(&u)
-                    .map_err(|io| CoreMLError::IoError(io))
+                    .map_err(CoreMLError::IoError)
                     .and_then(|file| {
                         let mut vec = vec![];
                         _ = flate2::read::ZlibDecoder::new(file)
                             .read_to_end(&mut vec)
-                            .map_err(|io| CoreMLError::IoError(io))?;
+                            .map_err(CoreMLError::IoError)?;
                         Ok(vec)
                     }) {
                     Ok(vec) => {
@@ -159,7 +159,7 @@ impl CoreMLBatchModelWithState {
                                 info.opts.cache_dir.join("model_cache")
                             };
                             match std::fs::File::create(&m)
-                                .map_err(|io| CoreMLError::IoError(io))
+                                .map_err(CoreMLError::IoError)
                                 .map(|file| {
                                     flate2::write::ZlibEncoder::new(file, Compression::best())
                                         .write_all(&vec)
@@ -232,15 +232,17 @@ impl std::fmt::Debug for BatchModel {
 
 impl CoreMLBatchModel {
     pub fn load_from_path(path: String, info: CoreMLModelInfo, compiled: bool) -> Self {
-        let coreml_model = Self {
+        Self {
             model: modelWithPathBatch(path, info.opts.compute_platform, compiled),
             // save_path: None,
             outputs: Default::default(),
-        };
-        coreml_model
+        }
     }
 
     pub fn load_buffer(mut buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
+        // `modelWithAssetsBatch` reconstructs the `Vec` from pointer, length and
+        // capacity, so ensure the length is the capacity first.
+        buf.shrink_to_fit();
         let coreml_model = Self {
             model: modelWithAssetsBatch(
                 buf.as_mut_ptr(),
@@ -267,7 +269,7 @@ impl CoreMLBatchModel {
         let shape: Vec<usize> = input.shape().to_vec();
         let arr = desc.input_shape(name.clone());
         if arr.len() != shape.len() || !arr.iter().eq(shape.iter()) {
-            if arr.len() == 0 {
+            if arr.is_empty() {
                 return Err(CoreMLError::BadInputShape(format!(
                     "Input feature name '{name}' not expected!"
                 )));
@@ -323,29 +325,25 @@ impl CoreMLBatchModel {
         if let Some(err) = output.getError() {
             return Err(CoreMLError::UnknownError(err));
         }
-        let n = output.count();
-        Ok(MLBatchModelOutput {
-            outputs: (0..n).into_iter().map(|i|
-                    (i, self
-                        .outputs
-                        .clone()
-                        .into_iter())
-                )
-                .map(|(i, s)| {
-                    let output = output.for_idx(i);
-                    s.flat_map(|(key, (ty, shape))| {
-                        if ty != "f32" {
-                            eprintln!("warning: non-f32 types aren't supported, and will be skipped in the output");
-                            return None;
-                        }
-                        let name = key.clone();
-                        let out = output.outputF32(name);
-                        let array = Array::from_shape_vec(shape, out).ok()?;
-                        Some((key, array.into()))
-                    })
-                    .collect::<HashMap<String, MLArray>>()
-                }).collect()
-        })
+        let mut outputs = Vec::with_capacity(output.count().max(0) as usize);
+        for index in 0..output.count() {
+            let mut prediction = output.for_idx(index);
+            let mut values = HashMap::with_capacity(self.outputs.len());
+            for (key, (ty, shape)) in &self.outputs {
+                if *ty != "f32" {
+                    eprintln!(
+                        "warning: non-f32 types aren't supported, and will be skipped in the output"
+                    );
+                    continue;
+                }
+                let out = prediction.outputF32(key.clone());
+                if let Ok(array) = Array::from_shape_vec(shape.clone(), out) {
+                    values.insert(key.clone(), array.into());
+                }
+            }
+            outputs.push(values);
+        }
+        Ok(MLBatchModelOutput { outputs })
     }
 
     pub fn description(&self) -> HashMap<&str, Vec<String>> {

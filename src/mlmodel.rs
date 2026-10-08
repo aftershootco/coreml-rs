@@ -12,7 +12,7 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
-pub use crate::swift::MLModelOutput;
+pub use crate::ffi::MLModelOutput;
 
 use thiserror::Error;
 
@@ -169,12 +169,12 @@ impl CoreMLModelWithState {
             }
             CoreMLModelLoader::BufferToDisk(u) => {
                 match std::fs::File::open(&u)
-                    .map_err(|io| CoreMLError::IoError(io))
+                    .map_err(CoreMLError::IoError)
                     .and_then(|file| {
                         let mut vec = vec![];
                         _ = flate2::read::ZlibDecoder::new(file)
                             .read_to_end(&mut vec)
-                            .map_err(|io| CoreMLError::IoError(io))?;
+                            .map_err(CoreMLError::IoError)?;
                         Ok(vec)
                     }) {
                     Ok(vec) => {
@@ -238,7 +238,7 @@ impl CoreMLModelWithState {
                                 info.opts.cache_dir.join("model_cache")
                             };
                             match std::fs::File::create(&m)
-                                .map_err(|io| CoreMLError::IoError(io))
+                                .map_err(CoreMLError::IoError)
                                 .map(|file| {
                                     flate2::write::ZlibEncoder::new(file, Compression::best())
                                         .write_all(&vec)
@@ -313,14 +313,16 @@ impl std::fmt::Debug for Model {
 
 impl CoreMLModel {
     pub fn load_from_path(path: String, info: CoreMLModelInfo, compiled: bool) -> Self {
-        let coreml_model = Self {
+        Self {
             model: modelWithPath(path, info.opts.compute_platform, compiled),
             outputs: Default::default(),
-        };
-        coreml_model
+        }
     }
 
     pub fn load_buffer(mut buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
+        // `modelWithAssets` reconstructs the `Vec` from the raw pointer, length
+        // and capacity, so make sure the length *is* the capacity first.
+        buf.shrink_to_fit();
         let coreml_model = Self {
             model: modelWithAssets(
                 buf.as_mut_ptr(),
@@ -345,7 +347,7 @@ impl CoreMLModel {
         let shape: Vec<usize> = input.shape().to_vec();
         let arr = desc.input_shape(name.clone());
         if arr.len() != shape.len() || !arr.iter().eq(shape.iter()) {
-            if arr.len() == 0 {
+            if arr.is_empty() {
                 return Err(CoreMLError::BadInputShape(format!(
                     "Input feature name '{name}' not expected!"
                 )));
@@ -423,7 +425,7 @@ impl CoreMLModel {
         let shape = arr.shape();
         self.outputs
             .insert(tag.as_ref().to_string(), ("f32", shape.to_vec()));
-        let shape: Vec<i32> = shape.into_iter().map(|i| *i as i32).collect();
+        let shape: Vec<i32> = shape.iter().map(|i| *i as i32).collect();
         let (mut data, offset) = arr.extract_to_tensor::<f32>().into_raw_vec_and_offset();
         assert!(
             matches!(offset, Some(0) | None),
@@ -439,6 +441,32 @@ impl CoreMLModel {
         true
     }
 
+    /// Binds an f16 output buffer. Unlike `add_output_f32` the array is built
+    /// here because `ndarray::zeros` needs `num-traits`, which `half::f16`
+    /// only implements behind an off-by-default feature.
+    pub fn add_output_f16(&mut self, tag: impl AsRef<str>, shape: Vec<usize>) -> bool {
+        let count: usize = shape.iter().product();
+        let Ok(array) = Array::from_shape_vec(shape.clone(), vec![half::f16::ZERO; count]) else {
+            return false;
+        };
+        let shape_i32: Vec<i32> = shape.iter().map(|dim| *dim as i32).collect();
+        self.outputs
+            .insert(tag.as_ref().to_string(), ("f16", shape));
+        let (mut data, offset) = array.into_raw_vec_and_offset();
+        assert!(
+            matches!(offset, Some(0) | None),
+            "array base offset is not zero; bad aligned output buffer"
+        );
+        let name = tag.as_ref().to_string();
+        let ptr = data.as_mut_ptr() as *mut u16;
+        let len = data.capacity();
+        if !self.model.bindOutputF16(shape_i32, name, ptr, len) {
+            return false;
+        }
+        std::mem::forget(data);
+        true
+    }
+
     pub fn predict(&mut self) -> Result<MLModelOutput, CoreMLError> {
         let desc = self.model.description();
         for name in desc.output_names() {
@@ -448,43 +476,43 @@ impl CoreMLModel {
                 "f32" => {
                     self.add_output_f32(name, Array::<f32, _>::zeros(output_shape));
                 }
+                "f16" => {
+                    self.add_output_f16(name, output_shape);
+                }
                 _ => {
                     return Err(CoreMLError::UnknownErrorStatic(
-                        "non-f32 output types are not supported (yet)!",
+                        "non-f32/f16 output types are not supported (yet)!",
                     ))
                 }
             }
         }
-        let output = self.model.predict();
+        let mut output = self.model.predict();
         if let Some(err) = output.getError() {
             return Err(CoreMLError::UnknownError(err));
         }
-        Ok(MLModelOutput {
-            outputs: self
-                .outputs
-                .clone()
-                .into_iter()
-                .filter_map(|(key, (ty, shape))| {
-                    let name = key.clone();
-                    match ty {
-                        "f32" => {
-                            let out = output.outputF32(name);
-                            let array = Array::from_shape_vec(shape, out).ok()?;
-                            Some((key, array.into()))
-                        }
-                        "f16" => {
-                            let out = output.outputU16(name);
-                            let array = reinterpret_u16_to_f16(Array::from_shape_vec(shape, out).ok()?);
-                            Some((key, array.into()))
-                        }
-                        _ => {
-                            eprintln!("warning: type not one of f32 or f16, and will be skipped in the output");
-                            return None;
-                        }
+        let mut outputs = HashMap::with_capacity(self.outputs.len());
+        for (key, (ty, shape)) in self.outputs.clone() {
+            match ty {
+                "f32" => {
+                    let out = output.outputF32(key.clone());
+                    if let Ok(array) = Array::from_shape_vec(shape, out) {
+                        outputs.insert(key, array.into());
                     }
-                })
-                .collect(),
-        })
+                }
+                "f16" => {
+                    let out = output.outputU16(key.clone());
+                    if let Ok(array) = Array::from_shape_vec(shape, out) {
+                        outputs.insert(key, reinterpret_u16_to_f16(array).into());
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "warning: type not one of f32 or f16, and will be skipped in the output"
+                    );
+                }
+            }
+        }
+        Ok(MLModelOutput { outputs })
     }
 
     pub fn description(&self) -> HashMap<&str, Vec<String>> {

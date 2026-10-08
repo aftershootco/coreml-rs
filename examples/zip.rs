@@ -33,8 +33,10 @@ pub fn main() {
 
     let model_path = unzip_to_path_from_hash(&buf).unwrap();
 
-    let mut model_options = CoreMLModelOptions::default();
-    model_options.compute_platform = ComputePlatform::CpuAndANE;
+    let model_options = CoreMLModelOptions {
+        compute_platform: ComputePlatform::CpuAndANE,
+        ..Default::default()
+    };
 
     let mut model = CoreMLModelWithState::new(model_path, model_options)
         .load()

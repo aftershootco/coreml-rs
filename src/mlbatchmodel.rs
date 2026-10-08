@@ -1,8 +1,8 @@
 use crate::{
+    ffi::MLBatchModelOutput,
     ffi::{modelWithAssetsBatch, modelWithPathBatch, BatchModel},
     mlarray::MLArray,
-    mlmodel::{CoreMLError, CoreMLModelInfo, CoreMLModelLoader},
-    ffi::MLBatchModelOutput,
+    mlmodel::{CoreMLError, CoreMLModelInfo, CoreMLModelLoader, OutputSpec},
     CoreMLModelOptions,
 };
 use flate2::Compression;
@@ -16,6 +16,8 @@ use tempfile::NamedTempFile;
 
 pub use crate::ffi::MLModelOutput;
 
+// See `CoreMLModelWithState`; boxing `Loaded` would change the public shape.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum CoreMLBatchModelWithState {
     Unloaded(CoreMLModelInfo, CoreMLModelLoader),
@@ -119,7 +121,7 @@ impl CoreMLBatchModelWithState {
 
     /// Might fail if system disk space too low(very unlikely)
     pub fn unload(self) -> Result<Self, CoreMLError> {
-        if let Self::Loaded(_, info, loader) = self {
+        if let Self::Loaded(model, info, loader) = self {
             Ok(Self::Unloaded(
                 info,
                 match loader {
@@ -130,7 +132,13 @@ impl CoreMLBatchModelWithState {
                             std::fs::read(temp_file.path()).map_err(CoreMLError::IoError)?,
                         )
                     }
-                    x => x,
+                    // Mirror the single-model path: after a path load the model
+                    // has a compiled copy, so reloading can skip compilation.
+                    CoreMLModelLoader::ModelPath(path) => match model.model.compiled_path() {
+                        Some(compiled) => CoreMLModelLoader::CompiledPath(compiled.into()),
+                        None => CoreMLModelLoader::ModelPath(path),
+                    },
+                    loader => loader,
                 },
             ))
         } else {
@@ -158,13 +166,13 @@ impl CoreMLBatchModelWithState {
                             } else {
                                 info.opts.cache_dir.join("model_cache")
                             };
-                            match std::fs::File::create(&m)
-                                .map_err(CoreMLError::IoError)
-                                .map(|file| {
+                            match std::fs::File::create(&m).map_err(CoreMLError::IoError).map(
+                                |file| {
                                     flate2::write::ZlibEncoder::new(file, Compression::best())
                                         .write_all(&vec)
                                         .map_err(CoreMLError::IoError)
-                                }) {
+                                },
+                            ) {
                                 Ok(_) => {}
                                 Err(err) => {
                                     return Err(CoreMLError::FailedToBatchLoad(
@@ -220,6 +228,9 @@ pub struct CoreMLBatchModel {
     model: BatchModel,
     // save_path: Option<PathBuf>,
     outputs: HashMap<String, (&'static str, Vec<usize>)>,
+    input_shapes: HashMap<String, Vec<usize>>,
+    output_specs: Vec<OutputSpec>,
+    described: bool,
 }
 
 unsafe impl Send for CoreMLBatchModel {}
@@ -236,6 +247,9 @@ impl CoreMLBatchModel {
             model: modelWithPathBatch(path, info.opts.compute_platform, compiled),
             // save_path: None,
             outputs: Default::default(),
+            input_shapes: Default::default(),
+            output_specs: Default::default(),
+            described: false,
         }
     }
 
@@ -251,9 +265,43 @@ impl CoreMLBatchModel {
             ),
             // save_path: None,
             outputs: Default::default(),
+            input_shapes: Default::default(),
+            output_specs: Default::default(),
+            described: false,
         };
         std::mem::forget(buf);
         coreml_model
+    }
+
+    /// Reads the feature metadata once, after the model is loaded, so the
+    /// prediction path stays off CoreML's description dictionaries.
+    fn ensure_described(&mut self) {
+        if self.described {
+            return;
+        }
+        let description = self.model.description();
+        self.input_shapes = description
+            .input_names()
+            .into_iter()
+            .map(|name| {
+                let shape = description.input_shape(name.clone());
+                (name, shape)
+            })
+            .collect();
+        self.output_specs = description
+            .output_names()
+            .into_iter()
+            .map(|name| {
+                let dtype = match description.output_type(name.clone()).as_str() {
+                    "f32" => "f32",
+                    "f16" => "f16",
+                    _ => "",
+                };
+                let shape = description.output_shape(name.clone());
+                OutputSpec { name, dtype, shape }
+            })
+            .collect();
+        self.described = true;
     }
 
     pub fn add_input(
@@ -265,9 +313,9 @@ impl CoreMLBatchModel {
         // route input correctly
         let input: MLArray = input.into();
         let name = tag.as_ref().to_string();
-        let desc = self.model.description();
         let shape: Vec<usize> = input.shape().to_vec();
-        let arr = desc.input_shape(name.clone());
+        self.ensure_described();
+        let arr = self.input_shapes.get(&name).cloned().unwrap_or_default();
         if arr.len() != shape.len() || !arr.iter().eq(shape.iter()) {
             if arr.is_empty() {
                 return Err(CoreMLError::BadInputShape(format!(
@@ -305,13 +353,12 @@ impl CoreMLBatchModel {
     }
 
     pub fn predict(&mut self) -> Result<MLBatchModelOutput, CoreMLError> {
-        let desc = self.model.description();
-        for name in desc.output_names() {
-            let shape = desc.output_shape(name.clone());
-            let ty = desc.output_type(name.clone());
-            match ty.as_str() {
+        self.ensure_described();
+        for spec in &self.output_specs {
+            match spec.dtype {
                 "f32" => {
-                    self.outputs.insert(name, ("f32", shape.to_vec()));
+                    self.outputs
+                        .insert(spec.name.clone(), ("f32", spec.shape.clone()));
                 }
                 _ => {
                     return Err(CoreMLError::UnknownErrorStatic(

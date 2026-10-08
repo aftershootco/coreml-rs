@@ -73,6 +73,9 @@ pub enum CoreMLModelLoader {
     BufferToDisk(PathBuf),
 }
 
+// The `Loaded` variant carries the whole live model; boxing it would change the
+// public enum's shape, and callers match on it directly.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum CoreMLModelWithState {
     Unloaded(CoreMLModelInfo, CoreMLModelLoader),
@@ -237,13 +240,13 @@ impl CoreMLModelWithState {
                             } else {
                                 info.opts.cache_dir.join("model_cache")
                             };
-                            match std::fs::File::create(&m)
-                                .map_err(CoreMLError::IoError)
-                                .map(|file| {
+                            match std::fs::File::create(&m).map_err(CoreMLError::IoError).map(
+                                |file| {
                                     flate2::write::ZlibEncoder::new(file, Compression::best())
                                         .write_all(&vec)
                                         .map_err(CoreMLError::IoError)
-                                }) {
+                                },
+                            ) {
                                 Ok(_) => {}
                                 Err(err) => {
                                     return Err(CoreMLError::FailedToLoad(
@@ -297,10 +300,22 @@ pub struct CoreMLModelInfo {
     pub opts: CoreMLModelOptions,
 }
 
+/// Everything the prediction path needs about one output. Read once from the
+/// CoreML description instead of on every `predict`.
+#[derive(Clone, Debug)]
+pub(crate) struct OutputSpec {
+    pub(crate) name: String,
+    pub(crate) dtype: &'static str,
+    pub(crate) shape: Vec<usize>,
+}
+
 #[derive(Debug)]
 pub struct CoreMLModel {
     model: Model,
     outputs: HashMap<String, (&'static str, Vec<usize>)>,
+    input_shapes: HashMap<String, Vec<usize>>,
+    output_specs: Vec<OutputSpec>,
+    described: bool,
 }
 
 unsafe impl Send for CoreMLModel {}
@@ -316,6 +331,9 @@ impl CoreMLModel {
         Self {
             model: modelWithPath(path, info.opts.compute_platform, compiled),
             outputs: Default::default(),
+            input_shapes: Default::default(),
+            output_specs: Default::default(),
+            described: false,
         }
     }
 
@@ -330,9 +348,44 @@ impl CoreMLModel {
                 info.opts.compute_platform,
             ),
             outputs: Default::default(),
+            input_shapes: Default::default(),
+            output_specs: Default::default(),
+            described: false,
         };
         std::mem::forget(buf);
         coreml_model
+    }
+
+    /// Reads the feature metadata once, after the model is loaded, so that
+    /// neither `add_input` nor `predict` has to walk CoreML's description
+    /// dictionaries on the hot path.
+    fn ensure_described(&mut self) {
+        if self.described {
+            return;
+        }
+        let description = self.model.description();
+        self.input_shapes = description
+            .input_names()
+            .into_iter()
+            .map(|name| {
+                let shape = description.input_shape(name.clone());
+                (name, shape)
+            })
+            .collect();
+        self.output_specs = description
+            .output_names()
+            .into_iter()
+            .map(|name| {
+                let dtype = match description.output_type(name.clone()).as_str() {
+                    "f32" => "f32",
+                    "f16" => "f16",
+                    _ => "",
+                };
+                let shape = description.output_shape(name.clone());
+                OutputSpec { name, dtype, shape }
+            })
+            .collect();
+        self.described = true;
     }
 
     pub fn add_input(
@@ -343,9 +396,9 @@ impl CoreMLModel {
         // route input correctly
         let input: MLArray = input.into();
         let name = tag.as_ref().to_string();
-        let desc = self.model.description();
         let shape: Vec<usize> = input.shape().to_vec();
-        let arr = desc.input_shape(name.clone());
+        self.ensure_described();
+        let arr = self.input_shapes.get(&name).cloned().unwrap_or_default();
         if arr.len() != shape.len() || !arr.iter().eq(shape.iter()) {
             if arr.is_empty() {
                 return Err(CoreMLError::BadInputShape(format!(
@@ -468,21 +521,24 @@ impl CoreMLModel {
     }
 
     pub fn predict(&mut self) -> Result<MLModelOutput, CoreMLError> {
-        let desc = self.model.description();
-        for name in desc.output_names() {
-            let output_shape = desc.output_shape(name.clone());
-            let ty = desc.output_type(name.clone());
-            match ty.as_str() {
+        self.ensure_described();
+        for index in 0..self.output_specs.len() {
+            let (name, dtype, shape) = {
+                let spec = &self.output_specs[index];
+                (spec.name.clone(), spec.dtype, spec.shape.clone())
+            };
+            match dtype {
                 "f32" => {
-                    self.add_output_f32(name, Array::<f32, _>::zeros(output_shape));
+                    self.add_output_f32(name, Array::<f32, _>::zeros(shape));
                 }
                 "f16" => {
-                    self.add_output_f16(name, output_shape);
+                    self.add_output_f16(name, shape);
                 }
                 _ => {
+                    self.outputs.clear();
                     return Err(CoreMLError::UnknownErrorStatic(
                         "non-f32/f16 output types are not supported (yet)!",
-                    ))
+                    ));
                 }
             }
         }
@@ -491,18 +547,18 @@ impl CoreMLModel {
             return Err(CoreMLError::UnknownError(err));
         }
         let mut outputs = HashMap::with_capacity(self.outputs.len());
-        for (key, (ty, shape)) in self.outputs.clone() {
-            match ty {
+        for (key, (ty, shape)) in &self.outputs {
+            match *ty {
                 "f32" => {
                     let out = output.outputF32(key.clone());
-                    if let Ok(array) = Array::from_shape_vec(shape, out) {
-                        outputs.insert(key, array.into());
+                    if let Ok(array) = Array::from_shape_vec(shape.clone(), out) {
+                        outputs.insert(key.clone(), array.into());
                     }
                 }
                 "f16" => {
                     let out = output.outputU16(key.clone());
-                    if let Ok(array) = Array::from_shape_vec(shape, out) {
-                        outputs.insert(key, reinterpret_u16_to_f16(array).into());
+                    if let Ok(array) = Array::from_shape_vec(shape.clone(), out) {
+                        outputs.insert(key.clone(), reinterpret_u16_to_f16(array).into());
                     }
                 }
                 _ => {

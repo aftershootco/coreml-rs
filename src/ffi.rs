@@ -303,6 +303,19 @@ impl ModelDescription {
             .unwrap_or_default()
     }
 
+    pub fn input_names(&self) -> Vec<String> {
+        self.inputs_by_name()
+            .map(|descriptions| {
+                descriptions
+                    .to_vecs()
+                    .0
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn output_names(&self) -> Vec<String> {
         self.outputs_by_name()
             .map(|descriptions| {
@@ -772,7 +785,7 @@ impl BatchModel {
         if self.model.is_some() {
             return true;
         }
-        let config = model_configuration(self.compute_units);
+        let config = batch_model_configuration(self.compute_units);
         if let Some(path) = &self.compiled_path {
             let url = file_url(path);
             return match unsafe {
@@ -1071,8 +1084,14 @@ fn unique_sibling(path: &Path, tag: &str) -> PathBuf {
 fn model_configuration(compute_units: MLComputeUnits) -> Retained<MLModelConfiguration> {
     let config = unsafe { MLModelConfiguration::new() };
     unsafe { config.setComputeUnits(compute_units) };
-    // CoreML's experimental MLE5 engine has historically crashed on newer
-    // macOS releases; the Swift shim disabled it and we keep that behaviour.
+    config
+}
+
+/// The batch path keeps the historical workaround that opts out of CoreML's
+/// experimental MLE5 engine. The single-model path never set it, and doing so
+/// slows model loading by more than 4x, so it must stay batch-only.
+fn batch_model_configuration(compute_units: MLComputeUnits) -> Retained<MLModelConfiguration> {
+    let config = model_configuration(compute_units);
     unsafe {
         let key = NSString::from_str("experimentalMLE5EngineUsage");
         let value = NSNumber::new_isize(1);
@@ -1201,9 +1220,8 @@ fn feature_dictionary(
         .keys()
         .map(|name| NSString::from_str(name))
         .collect();
-    let values: Vec<Retained<MLFeatureValue>> = features.values().cloned().collect();
     let key_refs: Vec<&NSString> = keys.iter().map(|key| &**key).collect();
-    let value_refs: Vec<&MLFeatureValue> = values.iter().map(|value| &**value).collect();
+    let value_refs: Vec<&MLFeatureValue> = features.values().map(|value| &**value).collect();
     let dictionary: Retained<NSDictionary<NSString, MLFeatureValue>> =
         NSDictionary::from_slices(&key_refs, &value_refs);
     // SAFETY: MLFeatureValue is an NSObject subclass, so the type parameter is
@@ -1218,10 +1236,8 @@ fn backing_dictionary(
         .keys()
         .map(|name| NSString::from_str(name))
         .collect();
-    let values: Vec<Retained<MLMultiArray>> =
-        outputs.values().map(|(array, _)| array.clone()).collect();
     let key_refs: Vec<&NSString> = keys.iter().map(|key| &**key).collect();
-    let value_refs: Vec<&MLMultiArray> = values.iter().map(|value| &**value).collect();
+    let value_refs: Vec<&MLMultiArray> = outputs.values().map(|(array, _)| &**array).collect();
     let dictionary: Retained<NSDictionary<NSString, MLMultiArray>> =
         NSDictionary::from_slices(&key_refs, &value_refs);
     // SAFETY: MLMultiArray is an NSObject subclass.

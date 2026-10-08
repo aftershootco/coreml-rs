@@ -98,6 +98,10 @@ impl MLType for u32 {
 //     const TY: usize = 8;
 // }
 
+// The transmutes below only change the `OwnedRepr<T>` marker back to the
+// concrete element type selected by `T::TY`; the arrays have identical layout,
+// so clippy's annotation request does not apply.
+#[allow(clippy::missing_transmute_annotations)]
 impl<T: MLType> From<ArrayBase<OwnedRepr<T>, Dim<IxDynImpl>>> for MLArray {
     fn from(value: ArrayBase<OwnedRepr<T>, Dim<IxDynImpl>>) -> Self {
         unsafe {
@@ -117,6 +121,7 @@ impl<T: MLType> From<ArrayBase<OwnedRepr<T>, Dim<IxDynImpl>>> for MLArray {
 }
 
 impl MLArray {
+    #[allow(clippy::missing_transmute_annotations)]
     pub fn extract_to_tensor<T: MLType>(self) -> Array<T, Dim<IxDynImpl>> {
         unsafe {
             match self {

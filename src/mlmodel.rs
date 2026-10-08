@@ -1,5 +1,5 @@
 use crate::{
-    ffi::{modelWithAssets, modelWithPath, ComputePlatform, Model},
+    ffi::{modelWithAssets, modelWithPackage, modelWithPath, ComputePlatform, Model},
     mlarray::MLArray,
     mlbatchmodel::CoreMLBatchModelWithState,
 };
@@ -71,6 +71,12 @@ pub enum CoreMLModelLoader {
     /// Model with buffer to manage the buffer locally
     Buffer(Vec<u8>),
     BufferToDisk(PathBuf),
+    /// In-memory `.mlpackage`: the model specification plus its weight blobs,
+    /// keyed by the file reference used in the spec (`weights/weight.bin`).
+    Package {
+        spec: Vec<u8>,
+        blobs: Vec<(String, Vec<u8>)>,
+    },
 }
 
 // The `Loaded` variant carries the whole live model; boxing it would change the
@@ -98,6 +104,36 @@ impl CoreMLModelWithState {
 
     pub fn from_buf(buf: Vec<u8>, opts: CoreMLModelOptions) -> Self {
         Self::Unloaded(CoreMLModelInfo { opts }, CoreMLModelLoader::Buffer(buf))
+    }
+
+    /// Builds a model from an in-memory `.mlpackage`: the `model.mlmodel`
+    /// specification plus its weight blobs.
+    ///
+    /// `blobs` maps the weight file reference used by the spec (usually
+    /// `weights/weight.bin`, with or without the `@model_path/` prefix) to the
+    /// file contents. This avoids materialising the package on disk.
+    ///
+    /// Requires macOS 15 or newer; on older systems loading fails and the
+    /// package must be loaded from its directory with [`Self::new`].
+    pub fn from_package(
+        spec: Vec<u8>,
+        blobs: Vec<(String, Vec<u8>)>,
+        opts: CoreMLModelOptions,
+    ) -> Self {
+        Self::Unloaded(
+            CoreMLModelInfo { opts },
+            CoreMLModelLoader::Package { spec, blobs },
+        )
+    }
+
+    /// Reads a `.mlpackage` directory into memory and loads it with
+    /// [`Self::from_package`]. Requires macOS 15 or newer.
+    pub fn from_package_dir(
+        package: impl AsRef<Path>,
+        opts: CoreMLModelOptions,
+    ) -> Result<Self, CoreMLError> {
+        let (spec, blobs) = read_package(package.as_ref())?;
+        Ok(Self::from_package(spec, blobs, opts))
     }
 
     /// Compiles the model package at `package` into a `.mlmodelc` at `dest`, replacing
@@ -169,6 +205,22 @@ impl CoreMLModelWithState {
                 }
                 let loader = CoreMLModelLoader::Buffer(vec);
                 Ok(Self::Loaded(coreml_model, info, loader))
+            }
+            CoreMLModelLoader::Package { spec, blobs } => {
+                let mut coreml_model =
+                    CoreMLModel::load_package(spec.clone(), blobs.clone(), info.clone());
+                coreml_model.model.load();
+                if coreml_model.model.failed() {
+                    return Err(CoreMLError::FailedToLoadStatic(
+                        "Failed to load in-memory model package; needs macOS 15+ and every weight blob",
+                        Self::Unloaded(info, CoreMLModelLoader::Package { spec, blobs }),
+                    ));
+                }
+                Ok(Self::Loaded(
+                    coreml_model,
+                    info,
+                    CoreMLModelLoader::Package { spec, blobs },
+                ))
             }
             CoreMLModelLoader::BufferToDisk(u) => {
                 match std::fs::File::open(&u)
@@ -356,6 +408,20 @@ impl CoreMLModel {
         coreml_model
     }
 
+    pub fn load_package(
+        spec: Vec<u8>,
+        blobs: Vec<(String, Vec<u8>)>,
+        info: CoreMLModelInfo,
+    ) -> Self {
+        Self {
+            model: modelWithPackage(spec, blobs, info.opts.compute_platform),
+            outputs: Default::default(),
+            input_shapes: Default::default(),
+            output_specs: Default::default(),
+            described: false,
+        }
+    }
+
     /// Reads the feature metadata once, after the model is loaded, so that
     /// neither `add_input` nor `predict` has to walk CoreML's description
     /// dictionaries on the hot path.
@@ -522,6 +588,9 @@ impl CoreMLModel {
 
     pub fn predict(&mut self) -> Result<MLModelOutput, CoreMLError> {
         self.ensure_described();
+        // Output backings are skipped once CoreML has rejected them for a
+        // dynamically-shaped output; predictions are then copied out.
+        let with_backings = self.model.backings_supported();
         for index in 0..self.output_specs.len() {
             let (name, dtype, shape) = {
                 let spec = &self.output_specs[index];
@@ -529,10 +598,14 @@ impl CoreMLModel {
             };
             match dtype {
                 "f32" => {
-                    self.add_output_f32(name, Array::<f32, _>::zeros(shape));
+                    if with_backings {
+                        self.add_output_f32(name, Array::<f32, _>::zeros(shape));
+                    }
                 }
                 "f16" => {
-                    self.add_output_f16(name, shape);
+                    if with_backings {
+                        self.add_output_f16(name, shape);
+                    }
                 }
                 _ => {
                     self.outputs.clear();
@@ -580,6 +653,52 @@ impl CoreMLModel {
     }
 }
 
+/// The specification and weight blobs of an in-memory `.mlpackage`.
+pub(crate) type PackageParts = (Vec<u8>, Vec<(String, Vec<u8>)>);
+
+/// Reads `Data/com.apple.CoreML/model.mlmodel` and every `@model_path/...`
+/// weight blob it references, resolved against the package's
+/// `Data/com.apple.CoreML` directory.
+pub(crate) fn read_package(package: &Path) -> Result<PackageParts, CoreMLError> {
+    let root = package.join("Data/com.apple.CoreML");
+    let spec = std::fs::read(root.join("model.mlmodel")).map_err(CoreMLError::IoError)?;
+    let mut blobs = Vec::new();
+    for reference in model_path_references(&spec) {
+        let data = std::fs::read(root.join(&reference)).map_err(CoreMLError::IoError)?;
+        blobs.push((reference, data));
+    }
+    Ok((spec, blobs))
+}
+
+/// Collects the `@model_path/...` file references embedded in a CoreML
+/// specification. The protobuf stores them as plain strings.
+fn model_path_references(spec: &[u8]) -> Vec<String> {
+    const PREFIX: &[u8] = b"@model_path/";
+    let mut references = Vec::new();
+    let mut search_from = 0;
+    while let Some(offset) = spec[search_from..]
+        .windows(PREFIX.len())
+        .position(|window| window == PREFIX)
+    {
+        let start = search_from + offset + PREFIX.len();
+        let mut end = start;
+        while end < spec.len() && is_reference_byte(spec[end]) {
+            end += 1;
+        }
+        if end > start {
+            references.push(String::from_utf8_lossy(&spec[start..end]).into_owned());
+        }
+        search_from = end.max(start + 1);
+    }
+    references.sort();
+    references.dedup();
+    references
+}
+
+fn is_reference_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'@')
+}
+
 fn reinterpret_u16_to_f16(input: ndarray::ArrayD<u16>) -> ndarray::ArrayD<half::f16> {
     let shape = input.shape().to_vec();
     let len = input.len();
@@ -604,4 +723,27 @@ fn reinterpret_u16_to_f16(input: ndarray::ArrayD<u16>) -> ndarray::ArrayD<half::
 
     // TODO SA: we know unwrap won't cause ShapeError, but avoid unwrap regardless
     ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), raw_vec_f16).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_path_references;
+
+    #[test]
+    fn collects_unique_model_path_references() {
+        let mut spec = Vec::new();
+        // Two BlobFileValue entries for the same file plus unrelated bytes.
+        spec.extend_from_slice(b"\x0a\x1e@model_path/weights/weight.bin\x10\x40");
+        spec.extend_from_slice(b"\x0a\x1e@model_path/weights/weight.bin\x10\x80\x08");
+        spec.extend_from_slice(b"not/a/reference\x00");
+        assert_eq!(
+            model_path_references(&spec),
+            vec!["weights/weight.bin".to_string()]
+        );
+    }
+
+    #[test]
+    fn handles_specs_without_references() {
+        assert!(model_path_references(b"\x08\x06").is_empty());
+    }
 }

@@ -1,8 +1,8 @@
 use crate::{
     ffi::MLBatchModelOutput,
-    ffi::{modelWithAssetsBatch, modelWithPathBatch, BatchModel},
+    ffi::{modelWithAssetsBatch, modelWithPackageBatch, modelWithPathBatch, BatchModel},
     mlarray::MLArray,
-    mlmodel::{CoreMLError, CoreMLModelInfo, CoreMLModelLoader, OutputSpec},
+    mlmodel::{read_package, CoreMLError, CoreMLModelInfo, CoreMLModelLoader, OutputSpec},
     CoreMLModelOptions,
 };
 use flate2::Compression;
@@ -40,6 +40,30 @@ impl CoreMLBatchModelWithState {
 
     pub fn from_buf(buf: Vec<u8>, opts: CoreMLModelOptions) -> Self {
         Self::Unloaded(CoreMLModelInfo { opts }, CoreMLModelLoader::Buffer(buf))
+    }
+
+    /// Builds a batch model from an in-memory `.mlpackage` specification and
+    /// its weight blobs. Requires macOS 15 or newer; see
+    /// [`crate::mlmodel::CoreMLModelWithState::from_package`].
+    pub fn from_package(
+        spec: Vec<u8>,
+        blobs: Vec<(String, Vec<u8>)>,
+        opts: CoreMLModelOptions,
+    ) -> Self {
+        Self::Unloaded(
+            CoreMLModelInfo { opts },
+            CoreMLModelLoader::Package { spec, blobs },
+        )
+    }
+
+    /// Reads a `.mlpackage` directory into memory for batch prediction.
+    /// Requires macOS 15 or newer.
+    pub fn from_package_dir(
+        package: impl AsRef<Path>,
+        opts: CoreMLModelOptions,
+    ) -> Result<Self, CoreMLError> {
+        let (spec, blobs) = read_package(package.as_ref())?;
+        Ok(Self::from_package(spec, blobs, opts))
     }
 
     pub fn load(self) -> Result<Self, CoreMLError> {
@@ -90,6 +114,22 @@ impl CoreMLBatchModelWithState {
                 }
                 let loader = CoreMLModelLoader::Buffer(vec);
                 Ok(Self::Loaded(coreml_model, info, loader))
+            }
+            CoreMLModelLoader::Package { spec, blobs } => {
+                let mut coreml_model =
+                    CoreMLBatchModel::load_package(spec.clone(), blobs.clone(), info.clone());
+                coreml_model.model.load();
+                if coreml_model.model.failed() {
+                    return Err(CoreMLError::FailedToLoadBatchStatic(
+                        "Failed to load in-memory model package; needs macOS 15+ and every weight blob",
+                        Self::Unloaded(info, CoreMLModelLoader::Package { spec, blobs }),
+                    ));
+                }
+                Ok(Self::Loaded(
+                    coreml_model,
+                    info,
+                    CoreMLModelLoader::Package { spec, blobs },
+                ))
             }
             CoreMLModelLoader::BufferToDisk(u) => {
                 match std::fs::File::open(&u)
@@ -271,6 +311,21 @@ impl CoreMLBatchModel {
         };
         std::mem::forget(buf);
         coreml_model
+    }
+
+    pub fn load_package(
+        spec: Vec<u8>,
+        blobs: Vec<(String, Vec<u8>)>,
+        info: CoreMLModelInfo,
+    ) -> Self {
+        Self {
+            model: modelWithPackageBatch(spec, blobs, info.opts.compute_platform),
+            // save_path: None,
+            outputs: Default::default(),
+            input_shapes: Default::default(),
+            output_specs: Default::default(),
+            described: false,
+        }
     }
 
     /// Reads the feature metadata once, after the model is loaded, so the

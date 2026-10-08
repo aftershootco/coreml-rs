@@ -31,7 +31,9 @@ use objc2_core_ml::{
     MLModelConfiguration, MLModelDescription, MLMultiArray, MLMultiArrayDataType,
     MLPredictionOptions,
 };
-use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSNumber, NSString, NSURL};
+use objc2_foundation::{
+    NSArray, NSData, NSDictionary, NSError, NSNumber, NSProcessInfo, NSString, NSURL,
+};
 
 use crate::mlarray::MLArray;
 
@@ -365,10 +367,17 @@ impl ModelDescription {
 pub struct Model {
     compiled_path: Option<PathBuf>,
     model_asset: Option<Retained<MLModelAsset>>,
+    /// The specification and blob `NSData` of an in-memory package. CoreML
+    /// resolves blob references lazily during the async asset load, so the
+    /// backing data must outlive this model.
+    package_data: Vec<Retained<NSData>>,
     model: Option<Retained<MLModel>>,
     inputs: HashMap<String, Retained<MLFeatureValue>>,
     outputs: HashMap<String, (Retained<MLMultiArray>, BackingBuffer)>,
     compute_units: MLComputeUnits,
+    /// Set when CoreML rejects output backings (dynamically-shaped outputs),
+    /// after which predictions copy their outputs out instead.
+    backings_unsupported: bool,
     failed_to_load: bool,
 }
 
@@ -382,10 +391,12 @@ impl Model {
         Self {
             compiled_path: None,
             model_asset: None,
+            package_data: Vec::new(),
             model: None,
             inputs: HashMap::new(),
             outputs: HashMap::new(),
             compute_units: compute.compute_units(),
+            backings_unsupported: false,
             failed_to_load: false,
         }
     }
@@ -521,6 +532,12 @@ impl Model {
             len,
             MLMultiArrayDataType::Float32,
         )
+    }
+
+    /// Whether this model still uses zero-copy output backings. False once
+    /// CoreML has rejected them for a dynamically-shaped output.
+    pub fn backings_supported(&self) -> bool {
+        !self.backings_unsupported
     }
 
     pub fn bindInputU16(
@@ -694,19 +711,54 @@ impl Model {
             Ok(provider) => provider,
             Err(err) => return ModelOutput::failed(err.localizedDescription().to_string()),
         };
+
+        // Prefer zero-copy output backings. CoreML refuses them for some
+        // dynamically-shaped outputs (seen with in-memory packages), so fall
+        // back to copying outputs out and remember the choice for this model.
+        if !self.backings_unsupported && !self.outputs.is_empty() {
+            let options = unsafe { MLPredictionOptions::new() };
+            let backings = backing_dictionary(&self.outputs);
+            unsafe { options.setOutputBackings(&backings) };
+            match unsafe {
+                model.predictionFromFeatures_options_error(
+                    ProtocolObject::from_ref(&*provider),
+                    &options,
+                )
+            } {
+                Ok(_) => {
+                    self.inputs.clear();
+                    return ModelOutput {
+                        inner: OutputInner::Backed(std::mem::take(&mut self.outputs)),
+                        error: None,
+                    };
+                }
+                Err(err)
+                    if err
+                        .localizedDescription()
+                        .to_string()
+                        .to_lowercase()
+                        .contains("output backings") =>
+                {
+                    log("CoreML rejected output backings; \
+                         falling back to copy-out prediction");
+                    self.outputs.clear();
+                    self.backings_unsupported = true;
+                }
+                Err(err) => return ModelOutput::failed(err.localizedDescription().to_string()),
+            }
+        }
+
         let options = unsafe { MLPredictionOptions::new() };
-        let backings = backing_dictionary(&self.outputs);
-        unsafe { options.setOutputBackings(&backings) };
         match unsafe {
             model.predictionFromFeatures_options_error(
                 ProtocolObject::from_ref(&*provider),
                 &options,
             )
         } {
-            Ok(_) => {
+            Ok(output) => {
                 self.inputs.clear();
                 ModelOutput {
-                    inner: OutputInner::Backed(std::mem::take(&mut self.outputs)),
+                    inner: OutputInner::Provider(output),
                     error: None,
                 }
             }
@@ -719,6 +771,8 @@ impl Model {
 pub struct BatchModel {
     compiled_path: Option<PathBuf>,
     model_asset: Option<Retained<MLModelAsset>>,
+    /// See `Model::package_data`.
+    package_data: Vec<Retained<NSData>>,
     model: Option<Retained<MLModel>>,
     inputs: Vec<HashMap<String, Retained<MLFeatureValue>>>,
     compute_units: MLComputeUnits,
@@ -733,6 +787,7 @@ impl BatchModel {
         Self {
             compiled_path: None,
             model_asset: None,
+            package_data: Vec::new(),
             model: None,
             inputs: Vec::new(),
             compute_units: compute.compute_units(),
@@ -960,6 +1015,118 @@ pub fn modelWithPathBatch(path: String, compute: ComputePlatform, compiled: bool
 /// Batch equivalent of [`modelWithAssets`].
 pub fn modelWithAssetsBatch(ptr: *mut u8, len: isize, compute: ComputePlatform) -> BatchModel {
     BatchModel::from_asset(ptr, len, compute)
+}
+
+/// Loads a model from an in-memory `.mlpackage`: the `model.mlmodel`
+/// specification plus its weight blobs.
+///
+/// `blobs` maps the weight file reference used by the specification (usually
+/// `weights/weight.bin`, with or without the `@model_path/` prefix) to the file
+/// contents. This is the in-memory equivalent of loading a package from its
+/// directory.
+///
+/// Requires macOS 15 or newer, where
+/// `+[MLModelAsset modelAssetWithSpecificationData:blobMapping:error:]` exists.
+/// On older systems the returned model is marked failed; load the package from
+/// its path instead.
+pub fn modelWithPackage(
+    spec: Vec<u8>,
+    blobs: Vec<(String, Vec<u8>)>,
+    compute: ComputePlatform,
+) -> Model {
+    let mut model = Model::empty(compute);
+    if !supports_in_memory_packages() {
+        log(
+            "in-memory `.mlpackage` loading requires macOS 15 or newer; \
+             load the package from its directory path instead",
+        );
+        model.failed_to_load = true;
+        return model;
+    }
+    match package_asset(spec, blobs) {
+        Ok((asset, data)) => {
+            model.model_asset = Some(asset);
+            model.package_data = data;
+        }
+        Err(err) => {
+            log(&format!("failed to read in-memory model package: {err}"));
+            model.failed_to_load = true;
+        }
+    }
+    model
+}
+
+/// Batch equivalent of [`modelWithPackage`].
+pub fn modelWithPackageBatch(
+    spec: Vec<u8>,
+    blobs: Vec<(String, Vec<u8>)>,
+    compute: ComputePlatform,
+) -> BatchModel {
+    let mut model = BatchModel::empty(compute);
+    if !supports_in_memory_packages() {
+        log(
+            "in-memory `.mlpackage` loading requires macOS 15 or newer; \
+             load the package from its directory path instead",
+        );
+        model.failed_to_load = true;
+        return model;
+    }
+    match package_asset(spec, blobs) {
+        Ok((asset, data)) => {
+            model.model_asset = Some(asset);
+            model.package_data = data;
+        }
+        Err(err) => {
+            log(&format!("failed to read in-memory model package: {err}"));
+            model.failed_to_load = true;
+        }
+    }
+    model
+}
+
+/// Builds an `MLModelAsset` from an in-memory specification and its blobs.
+///
+/// Returns the specification and blob `NSData` alongside the asset so the
+/// caller can keep them alive until the model has finished loading.
+fn package_asset(
+    spec: Vec<u8>,
+    blobs: Vec<(String, Vec<u8>)>,
+) -> Result<(Retained<MLModelAsset>, Vec<Retained<NSData>>), String> {
+    let specification = NSData::from_vec(spec);
+    let keys: Vec<Retained<NSURL>> = blobs
+        .iter()
+        .map(|(path, _)| NSURL::fileURLWithPath(&NSString::from_str(&normalize_blob_key(path))))
+        .collect();
+    // `NSData::from_vec` takes ownership of each blob, so no data is copied.
+    let values: Vec<Retained<NSData>> = blobs
+        .into_iter()
+        .map(|(_, data)| NSData::from_vec(data))
+        .collect();
+    let key_refs: Vec<&NSURL> = keys.iter().map(|key| &**key).collect();
+    let value_refs: Vec<&NSData> = values.iter().map(|value| &**value).collect();
+    let mapping: Retained<NSDictionary<NSURL, NSData>> =
+        NSDictionary::from_slices(&key_refs, &value_refs);
+    // SAFETY: the specification and every referenced blob are valid NSData.
+    let asset = unsafe {
+        MLModelAsset::modelAssetWithSpecificationData_blobMapping_error(&specification, &mapping)
+    }
+    .map_err(|err| err.localizedDescription().to_string())?;
+    let mut keep_alive = values;
+    keep_alive.push(specification);
+    Ok((asset, keep_alive))
+}
+
+/// The spec's `@model_path/...` references are looked up after the prefix.
+fn normalize_blob_key(path: &str) -> String {
+    path.trim_start_matches("@model_path/")
+        .trim_start_matches("Data/com.apple.CoreML/")
+        .to_string()
+}
+
+/// `modelAssetWithSpecificationData:blobMapping:error:` is macOS 15+.
+fn supports_in_memory_packages() -> bool {
+    let version = NSProcessInfo::processInfo().operatingSystemVersion();
+    version.majorVersion >= 15
 }
 
 /// Compiles a model package and atomically moves the result to `to`.

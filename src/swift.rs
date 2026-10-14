@@ -42,6 +42,8 @@ pub mod swift {
             compute: ComputePlatform,
             compiled: bool,
         ) -> BatchModel;
+        #[swift_bridge(swift_name = "compileModelTo")]
+        pub fn compileModelTo(model: String, to: String) -> Option<String>;
     }
 
     extern "Swift" {

@@ -97,6 +97,26 @@ impl CoreMLModelWithState {
         Self::Unloaded(CoreMLModelInfo { opts }, CoreMLModelLoader::Buffer(buf))
     }
 
+    /// Compiles the model package at `package` into a `.mlmodelc` at `dest`, replacing
+    /// whatever is there. Unlike [`Self::new`] (which compiles into a system temp dir on
+    /// every load), the result persists, so callers can later use [`Self::new_compiled`]
+    /// and skip compilation entirely.
+    pub fn compile_to(
+        package: impl AsRef<Path>,
+        dest: impl AsRef<Path>,
+    ) -> Result<(), CoreMLError> {
+        match crate::ffi::compileModelTo(
+            package.as_ref().display().to_string(),
+            dest.as_ref().display().to_string(),
+        ) {
+            None => Ok(()),
+            Some(err) => Err(CoreMLError::UnknownError(format!(
+                "failed to compile model to {}: {err}",
+                dest.as_ref().display()
+            ))),
+        }
+    }
+
     pub fn load(self) -> Result<Self, CoreMLError> {
         let Self::Unloaded(info, loader) = self else {
             return Ok(self);

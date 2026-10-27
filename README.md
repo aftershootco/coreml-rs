@@ -1,11 +1,20 @@
-## Core-ML Rust Bindings (Work in Progress)
+## coreml-rs
 
-`coreml-rs` is an experimental Rust library aimed at providing Rust bindings for Apple's Core ML framework.
-Core ML is Apple's machine learning framework designed to integrate machine learning models into iOS, macOS, watchOS, and tvOS applications.
+`coreml-rs` is an experimental Rust library providing bindings for Apple's Core ML framework.
+Core ML is Apple's machine learning framework for integrating machine learning models into macOS applications.
 
-### NOTES:
+The crate talks to the Objective-C framework directly through [`objc2`](https://crates.io/crates/objc2) and
+[`objc2-core-ml`](https://crates.io/crates/objc2-core-ml). There is **no Swift runtime dependency and no Swift
+toolchain requirement**: building needs only a Rust toolchain and the macOS SDK, and the resulting binary links
+only system frameworks.
 
-`libswift_Concurrency.dylib` is required for the builds to work, put the dylib next to the built binary to run the process.
+### Requirements
+
+- macOS 13 or newer (the CoreML features this crate uses, such as `MLModelAsset`, require it).
+- The macOS SDK with the CoreML framework.
+
+> Earlier versions linked a Swift static library and required `libswift_Concurrency.dylib` (and, on Intel, a
+> correctly deployed Swift runtime). That is no longer the case.
 
 ## Status
 
@@ -20,16 +29,16 @@ The primary goal is to enable Rust developers to utilize Core ML models within t
 
 ## Features
 
-- **Model Loading**: Load Core ML models into Rust applications.
-- **Inference**: Perform inference using loaded models.
-- **Data Handling**: Manage input and output data for model inference.
+- **Model Loading**: Load Core ML models into Rust applications, either from disk or from an in-memory buffer.
+- **Inference**: Perform inference using loaded models, with caller-owned output buffers (zero copy).
+- **Data Handling**: `f32`, `f16` (as `u16`), and `i32` tensor inputs; `f32` and `f16` outputs.
 
 ## Installation
 
 To include `coreml-rs` in your project, add the following to your `Cargo.toml` dependencies:
 ```toml
 [dependencies]
-coreml-rs = { version = "0.4", git = "https://github.com/swarnimarun/coreml-rs" }
+coreml-rs = { git = "https://github.com/aftershootco/coreml-rs" }
 ```
 
 ## Usage
@@ -40,13 +49,15 @@ Load a Core ML model from a `.mlmodel` file and perform a single inference:
 
 ```rust
 use coreml_rs::{ComputePlatform, CoreMLModelOptions, CoreMLModelWithState};
-use ndarray::Array4;
+use ndarray::{Array, Array4};
 
 pub fn main() {
     let file = std::fs::read("./demo/model_3.mlmodel").unwrap();
 
-    let mut model_options = CoreMLModelOptions::default();
-    model_options.compute_platform = ComputePlatform::CpuAndANE;
+    let model_options = CoreMLModelOptions {
+        compute_platform: ComputePlatform::CpuAndANE,
+        ..Default::default()
+    };
 
     let mut model = CoreMLModelWithState::from_buf(file, model_options);
 
@@ -57,57 +68,62 @@ pub fn main() {
         panic!("failed to add input feature, `image` to the model");
     };
 
-    let output = model.predict();
-
-    let v = output.unwrap().bytesFrom("output_1".to_string());
-    let output: Array4<f32> = Array4::from_shape_vec([1, 3, 2048, 2048], v).unwrap();
+    let output = model.predict().unwrap();
+    for (_name, value) in output.outputs {
+        let _output: Array<f32, _> = value.extract_to_tensor();
+    }
 
     // Use output as needed
 }
 ```
 
+`CoreMLModelWithState::new` accepts a `.mlmodel`/`.mlpackage` that is compiled on load, and
+`CoreMLModelWithState::new_compiled` accepts an already compiled `.mlmodelc`. Use
+`CoreMLModelWithState::compile_to(package, dest)` to compile once into a permanent location and load it
+later with `new_compiled`.
+
 ### Batch Inference
 
-Perform batch inference by adding multiple inputs:
+Batch prediction uses `CoreMLBatchModelWithState`:
 
 ```rust
-use coreml_rs::{ComputePlatform, CoreMLModelOptions, CoreMLModelWithState};
-use ndarray::Array4;
+use coreml_rs::{mlbatchmodel::CoreMLBatchModelWithState, ComputePlatform, CoreMLModelOptions};
+use ndarray::{Array, Array4};
 
 pub fn main() {
     let file = std::fs::read("./demo/model_3.mlmodel").unwrap();
 
-    let mut model_options = CoreMLModelOptions::default();
-    model_options.compute_platform = ComputePlatform::CpuAndANE;
+    let model_options = CoreMLModelOptions {
+        compute_platform: ComputePlatform::CpuAndANE,
+        ..Default::default()
+    };
 
-    let mut model = CoreMLModelWithState::from_buf(file, model_options);
+    let mut model = CoreMLBatchModelWithState::from_buf(file, model_options);
 
     let mut input = Array4::<f32>::zeros((1, 3, 512, 512));
     input.fill(1.0f32);
 
-    // Add multiple inputs for batch processing
-    for i in 0..10 {
-        let _ = model.add_input("image", input.clone().into_dyn(), i);
+    // Add one input per batch element.
+    for index in 0..10 {
+        let _ = model.add_input("image", input.clone().into_dyn(), index);
     }
 
     let output = model.predict().unwrap();
-
-    // Process batch outputs
-    for i in 0..10 {
-        let v = output.bytesFrom(&format!("output_1_{}", i));
-        let batch_output: Array4<f32> = Array4::from_shape_vec([1, 3, 2048, 2048], v).unwrap();
-        // Use batch_output as needed
+    for element in output.outputs {
+        for (_name, value) in element {
+            let _output: Array<f32, _> = value.extract_to_tensor();
+        }
     }
 }
 ```
 
-### Loading from Zip Archive
+### Loading from a Zip Archive
 
 Load a model from a zip archive containing an `.mlpackage`:
 
 ```rust
 use coreml_rs::{ComputePlatform, CoreMLModelOptions, CoreMLModelWithState};
-use ndarray::Array4;
+use ndarray::{Array, Array4};
 use std::path::PathBuf;
 
 fn unzip_to_path_from_hash(buf: &[u8]) -> Option<PathBuf> {
@@ -141,8 +157,10 @@ pub fn main() {
 
     let model_path = unzip_to_path_from_hash(&buf).unwrap();
 
-    let mut model_options = CoreMLModelOptions::default();
-    model_options.compute_platform = ComputePlatform::CpuAndANE;
+    let model_options = CoreMLModelOptions {
+        compute_platform: ComputePlatform::CpuAndANE,
+        ..Default::default()
+    };
 
     let mut model = CoreMLModelWithState::new(model_path, model_options).load().unwrap();
 
@@ -153,10 +171,10 @@ pub fn main() {
         panic!("failed to add input feature, `image` to the model");
     };
 
-    let output = model.predict();
-
-    let v = output.unwrap().bytesFrom("output_1".to_string());
-    let output: Array4<f32> = Array4::from_shape_vec([1, 3, 2048, 2048], v).unwrap();
+    let output = model.predict().unwrap();
+    for (_name, value) in output.outputs {
+        let _output: Array<f32, _> = value.extract_to_tensor();
+    }
 
     // Use output as needed
 }
@@ -173,8 +191,10 @@ use ndarray::Array4;
 pub fn main() {
     let file = std::fs::read("./demo/model_3.mlmodel").unwrap();
 
-    let mut model_options = CoreMLModelOptions::default();
-    model_options.compute_platform = ComputePlatform::CpuAndANE;
+    let model_options = CoreMLModelOptions {
+        compute_platform: ComputePlatform::CpuAndANE,
+        ..Default::default()
+    };
 
     let mut model = CoreMLModelWithState::from_buf(file, model_options);
 
@@ -185,15 +205,12 @@ pub fn main() {
         panic!("failed to add input feature, `image` to the model");
     };
 
-    let output = model.predict();
-
-    let v = output.unwrap().bytesFrom("output_1".to_string());
-    let output: Array4<f32> = Array4::from_shape_vec([1, 3, 2048, 2048], v).unwrap();
+    let _ = model.predict();
 
     // Unload model to free memory
     let unloaded_model = model.unload().unwrap();
 
-    // Later, reload the model
+    // Later, reload the model (from the compiled cache, without recompiling)
     let mut model = unloaded_model.load().unwrap();
 
     // Add input again and predict
@@ -201,10 +218,7 @@ pub fn main() {
         panic!("failed to add input feature, `image` to the model");
     };
 
-    let output = model.predict();
-
-    let v = output.unwrap().bytesFrom("output_1".to_string());
-    let output: Array4<f32> = Array4::from_shape_vec([1, 3, 2048, 2048], v).unwrap();
+    let _ = model.predict();
 
     // Use output as needed
 }

@@ -10,6 +10,19 @@ pub fn load_empty() {
     assert!(matches!(res, Err(CoreMLError::FailedToLoadStatic(_, _))));
 }
 
+/// Reads a fixture from the (gitignored) `demo` directory. Tests that need one
+/// report a skip instead of failing with ENOENT when it is absent.
+fn read_demo(name: &str) -> Option<Vec<u8>> {
+    let path = PathBuf::from("./demo").join(name);
+    match std::fs::read(&path) {
+        Ok(buf) => Some(buf),
+        Err(err) => {
+            eprintln!("skipping: {} is unavailable ({err})", path.display());
+            None
+        }
+    }
+}
+
 pub fn unzip_to_path_from_hash(buf: &[u8]) -> Option<PathBuf> {
     fn get_cache_filename(model_buffer: &[u8]) -> String {
         let mut hasher = Sha256::new();
@@ -42,9 +55,12 @@ pub fn unzip_to_path_from_hash(buf: &[u8]) -> Option<PathBuf> {
 
 #[test]
 pub fn reload_from_compiled_path() {
-    let model_path = "./demo/model.zip";
-    let buf = std::fs::read(model_path).unwrap();
-    let path = unzip_to_path_from_hash(&buf).unwrap();
+    let Some(buf) = read_demo("model.zip") else {
+        return;
+    };
+    let Some(path) = unzip_to_path_from_hash(&buf) else {
+        return;
+    };
     let m = CoreMLModelWithState::new(&path, CoreMLModelOptions::default());
     let res = m.load();
     assert!(!matches!(res, Err(CoreMLError::FailedToLoadStatic(_, _))));
@@ -59,8 +75,9 @@ pub fn reload_from_compiled_path() {
 
 #[test]
 pub fn reload_from_buf() {
-    let model_path = "./demo/model_3.mlmodel";
-    let buf = std::fs::read(model_path).unwrap();
+    let Some(buf) = read_demo("model_3.mlmodel") else {
+        return;
+    };
     let m = CoreMLModelWithState::from_buf(buf, CoreMLModelOptions::default());
     let res = m.load();
     assert!(!matches!(res, Err(CoreMLError::FailedToLoadStatic(_, _))));

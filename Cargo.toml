@@ -2,8 +2,9 @@
 name = "coreml-rs"
 version = "0.5.4"
 edition = "2021"
-description = "CoreML bindings for Rust using swift-bridge to maximize performance"
+description = "CoreML bindings for Rust, talking to the Objective-C framework directly through objc2"
 license-file = "LICENSE"
+rust-version = "1.71"
 
 [dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
@@ -12,12 +13,14 @@ flate2 = "1.1.0"
 half = { version = "2.4.1", features = ["alloc", "serde", "zerocopy"] }
 ndarray = { version = "0.17.2", features = ["serde", "blas"] }
 num = "0.4.3"
-swift-bridge = "0.1"
 tempfile = "3.0"
 thiserror = "2.0.12"
 
-[build-dependencies]
-swift-bridge-build = "0.1"
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-core-ml = "0.3"
+objc2-foundation = "0.3"
 
 [dev-dependencies]
 libproc = "0.14.4"

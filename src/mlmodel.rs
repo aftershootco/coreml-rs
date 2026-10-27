@@ -1,5 +1,5 @@
 use crate::{
-    ffi::{modelWithAssets, modelWithPath, ComputePlatform, Model},
+    ffi::{modelWithAssets, modelWithPackage, modelWithPath, ComputePlatform, Model},
     mlarray::MLArray,
     mlbatchmodel::CoreMLBatchModelWithState,
 };
@@ -12,7 +12,7 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
-pub use crate::swift::MLModelOutput;
+pub use crate::ffi::MLModelOutput;
 
 use thiserror::Error;
 
@@ -71,8 +71,17 @@ pub enum CoreMLModelLoader {
     /// Model with buffer to manage the buffer locally
     Buffer(Vec<u8>),
     BufferToDisk(PathBuf),
+    /// In-memory `.mlpackage`: the model specification plus its weight blobs,
+    /// keyed by the file reference used in the spec (`weights/weight.bin`).
+    Package {
+        spec: Vec<u8>,
+        blobs: Vec<(String, Vec<u8>)>,
+    },
 }
 
+// The `Loaded` variant carries the whole live model; boxing it would change the
+// public enum's shape, and callers match on it directly.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum CoreMLModelWithState {
     Unloaded(CoreMLModelInfo, CoreMLModelLoader),
@@ -95,6 +104,36 @@ impl CoreMLModelWithState {
 
     pub fn from_buf(buf: Vec<u8>, opts: CoreMLModelOptions) -> Self {
         Self::Unloaded(CoreMLModelInfo { opts }, CoreMLModelLoader::Buffer(buf))
+    }
+
+    /// Builds a model from an in-memory `.mlpackage`: the `model.mlmodel`
+    /// specification plus its weight blobs.
+    ///
+    /// `blobs` maps the weight file reference used by the spec (usually
+    /// `weights/weight.bin`, with or without the `@model_path/` prefix) to the
+    /// file contents. This avoids materialising the package on disk.
+    ///
+    /// Requires macOS 15 or newer; on older systems loading fails and the
+    /// package must be loaded from its directory with [`Self::new`].
+    pub fn from_package(
+        spec: Vec<u8>,
+        blobs: Vec<(String, Vec<u8>)>,
+        opts: CoreMLModelOptions,
+    ) -> Self {
+        Self::Unloaded(
+            CoreMLModelInfo { opts },
+            CoreMLModelLoader::Package { spec, blobs },
+        )
+    }
+
+    /// Reads a `.mlpackage` directory into memory and loads it with
+    /// [`Self::from_package`]. Requires macOS 15 or newer.
+    pub fn from_package_dir(
+        package: impl AsRef<Path>,
+        opts: CoreMLModelOptions,
+    ) -> Result<Self, CoreMLError> {
+        let (spec, blobs) = read_package(package.as_ref())?;
+        Ok(Self::from_package(spec, blobs, opts))
     }
 
     /// Compiles the model package at `package` into a `.mlmodelc` at `dest`, replacing
@@ -167,14 +206,30 @@ impl CoreMLModelWithState {
                 let loader = CoreMLModelLoader::Buffer(vec);
                 Ok(Self::Loaded(coreml_model, info, loader))
             }
+            CoreMLModelLoader::Package { spec, blobs } => {
+                let mut coreml_model =
+                    CoreMLModel::load_package(spec.clone(), blobs.clone(), info.clone());
+                coreml_model.model.load();
+                if coreml_model.model.failed() {
+                    return Err(CoreMLError::FailedToLoadStatic(
+                        "Failed to load in-memory model package; needs macOS 15+ and every weight blob",
+                        Self::Unloaded(info, CoreMLModelLoader::Package { spec, blobs }),
+                    ));
+                }
+                Ok(Self::Loaded(
+                    coreml_model,
+                    info,
+                    CoreMLModelLoader::Package { spec, blobs },
+                ))
+            }
             CoreMLModelLoader::BufferToDisk(u) => {
                 match std::fs::File::open(&u)
-                    .map_err(|io| CoreMLError::IoError(io))
+                    .map_err(CoreMLError::IoError)
                     .and_then(|file| {
                         let mut vec = vec![];
                         _ = flate2::read::ZlibDecoder::new(file)
                             .read_to_end(&mut vec)
-                            .map_err(|io| CoreMLError::IoError(io))?;
+                            .map_err(CoreMLError::IoError)?;
                         Ok(vec)
                     }) {
                     Ok(vec) => {
@@ -237,13 +292,13 @@ impl CoreMLModelWithState {
                             } else {
                                 info.opts.cache_dir.join("model_cache")
                             };
-                            match std::fs::File::create(&m)
-                                .map_err(|io| CoreMLError::IoError(io))
-                                .map(|file| {
+                            match std::fs::File::create(&m).map_err(CoreMLError::IoError).map(
+                                |file| {
                                     flate2::write::ZlibEncoder::new(file, Compression::best())
                                         .write_all(&vec)
                                         .map_err(CoreMLError::IoError)
-                                }) {
+                                },
+                            ) {
                                 Ok(_) => {}
                                 Err(err) => {
                                     return Err(CoreMLError::FailedToLoad(
@@ -297,10 +352,22 @@ pub struct CoreMLModelInfo {
     pub opts: CoreMLModelOptions,
 }
 
+/// Everything the prediction path needs about one output. Read once from the
+/// CoreML description instead of on every `predict`.
+#[derive(Clone, Debug)]
+pub(crate) struct OutputSpec {
+    pub(crate) name: String,
+    pub(crate) dtype: &'static str,
+    pub(crate) shape: Vec<usize>,
+}
+
 #[derive(Debug)]
 pub struct CoreMLModel {
     model: Model,
     outputs: HashMap<String, (&'static str, Vec<usize>)>,
+    input_shapes: HashMap<String, Vec<usize>>,
+    output_specs: Vec<OutputSpec>,
+    described: bool,
 }
 
 unsafe impl Send for CoreMLModel {}
@@ -313,14 +380,19 @@ impl std::fmt::Debug for Model {
 
 impl CoreMLModel {
     pub fn load_from_path(path: String, info: CoreMLModelInfo, compiled: bool) -> Self {
-        let coreml_model = Self {
+        Self {
             model: modelWithPath(path, info.opts.compute_platform, compiled),
             outputs: Default::default(),
-        };
-        coreml_model
+            input_shapes: Default::default(),
+            output_specs: Default::default(),
+            described: false,
+        }
     }
 
     pub fn load_buffer(mut buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
+        // `modelWithAssets` reconstructs the `Vec` from the raw pointer, length
+        // and capacity, so make sure the length *is* the capacity first.
+        buf.shrink_to_fit();
         let coreml_model = Self {
             model: modelWithAssets(
                 buf.as_mut_ptr(),
@@ -328,9 +400,58 @@ impl CoreMLModel {
                 info.opts.compute_platform,
             ),
             outputs: Default::default(),
+            input_shapes: Default::default(),
+            output_specs: Default::default(),
+            described: false,
         };
         std::mem::forget(buf);
         coreml_model
+    }
+
+    pub fn load_package(
+        spec: Vec<u8>,
+        blobs: Vec<(String, Vec<u8>)>,
+        info: CoreMLModelInfo,
+    ) -> Self {
+        Self {
+            model: modelWithPackage(spec, blobs, info.opts.compute_platform),
+            outputs: Default::default(),
+            input_shapes: Default::default(),
+            output_specs: Default::default(),
+            described: false,
+        }
+    }
+
+    /// Reads the feature metadata once, after the model is loaded, so that
+    /// neither `add_input` nor `predict` has to walk CoreML's description
+    /// dictionaries on the hot path.
+    fn ensure_described(&mut self) {
+        if self.described {
+            return;
+        }
+        let description = self.model.description();
+        self.input_shapes = description
+            .input_names()
+            .into_iter()
+            .map(|name| {
+                let shape = description.input_shape(name.clone());
+                (name, shape)
+            })
+            .collect();
+        self.output_specs = description
+            .output_names()
+            .into_iter()
+            .map(|name| {
+                let dtype = match description.output_type(name.clone()).as_str() {
+                    "f32" => "f32",
+                    "f16" => "f16",
+                    _ => "",
+                };
+                let shape = description.output_shape(name.clone());
+                OutputSpec { name, dtype, shape }
+            })
+            .collect();
+        self.described = true;
     }
 
     pub fn add_input(
@@ -341,11 +462,11 @@ impl CoreMLModel {
         // route input correctly
         let input: MLArray = input.into();
         let name = tag.as_ref().to_string();
-        let desc = self.model.description();
         let shape: Vec<usize> = input.shape().to_vec();
-        let arr = desc.input_shape(name.clone());
+        self.ensure_described();
+        let arr = self.input_shapes.get(&name).cloned().unwrap_or_default();
         if arr.len() != shape.len() || !arr.iter().eq(shape.iter()) {
-            if arr.len() == 0 {
+            if arr.is_empty() {
                 return Err(CoreMLError::BadInputShape(format!(
                     "Input feature name '{name}' not expected!"
                 )));
@@ -423,7 +544,7 @@ impl CoreMLModel {
         let shape = arr.shape();
         self.outputs
             .insert(tag.as_ref().to_string(), ("f32", shape.to_vec()));
-        let shape: Vec<i32> = shape.into_iter().map(|i| *i as i32).collect();
+        let shape: Vec<i32> = shape.iter().map(|i| *i as i32).collect();
         let (mut data, offset) = arr.extract_to_tensor::<f32>().into_raw_vec_and_offset();
         assert!(
             matches!(offset, Some(0) | None),
@@ -439,52 +560,88 @@ impl CoreMLModel {
         true
     }
 
+    /// Binds an f16 output buffer. Unlike `add_output_f32` the array is built
+    /// here because `ndarray::zeros` needs `num-traits`, which `half::f16`
+    /// only implements behind an off-by-default feature.
+    pub fn add_output_f16(&mut self, tag: impl AsRef<str>, shape: Vec<usize>) -> bool {
+        let count: usize = shape.iter().product();
+        let Ok(array) = Array::from_shape_vec(shape.clone(), vec![half::f16::ZERO; count]) else {
+            return false;
+        };
+        let shape_i32: Vec<i32> = shape.iter().map(|dim| *dim as i32).collect();
+        self.outputs
+            .insert(tag.as_ref().to_string(), ("f16", shape));
+        let (mut data, offset) = array.into_raw_vec_and_offset();
+        assert!(
+            matches!(offset, Some(0) | None),
+            "array base offset is not zero; bad aligned output buffer"
+        );
+        let name = tag.as_ref().to_string();
+        let ptr = data.as_mut_ptr() as *mut u16;
+        let len = data.capacity();
+        if !self.model.bindOutputF16(shape_i32, name, ptr, len) {
+            return false;
+        }
+        std::mem::forget(data);
+        true
+    }
+
     pub fn predict(&mut self) -> Result<MLModelOutput, CoreMLError> {
-        let desc = self.model.description();
-        for name in desc.output_names() {
-            let output_shape = desc.output_shape(name.clone());
-            let ty = desc.output_type(name.clone());
-            match ty.as_str() {
+        self.ensure_described();
+        // Output backings are skipped once CoreML has rejected them for a
+        // dynamically-shaped output; predictions are then copied out.
+        let with_backings = self.model.backings_supported();
+        for index in 0..self.output_specs.len() {
+            let (name, dtype, shape) = {
+                let spec = &self.output_specs[index];
+                (spec.name.clone(), spec.dtype, spec.shape.clone())
+            };
+            match dtype {
                 "f32" => {
-                    self.add_output_f32(name, Array::<f32, _>::zeros(output_shape));
+                    if with_backings {
+                        self.add_output_f32(name, Array::<f32, _>::zeros(shape));
+                    }
+                }
+                "f16" => {
+                    if with_backings {
+                        self.add_output_f16(name, shape);
+                    }
                 }
                 _ => {
+                    self.outputs.clear();
                     return Err(CoreMLError::UnknownErrorStatic(
-                        "non-f32 output types are not supported (yet)!",
-                    ))
+                        "non-f32/f16 output types are not supported (yet)!",
+                    ));
                 }
             }
         }
-        let output = self.model.predict();
+        let mut output = self.model.predict();
         if let Some(err) = output.getError() {
             return Err(CoreMLError::UnknownError(err));
         }
-        Ok(MLModelOutput {
-            outputs: self
-                .outputs
-                .clone()
-                .into_iter()
-                .filter_map(|(key, (ty, shape))| {
-                    let name = key.clone();
-                    match ty {
-                        "f32" => {
-                            let out = output.outputF32(name);
-                            let array = Array::from_shape_vec(shape, out).ok()?;
-                            Some((key, array.into()))
-                        }
-                        "f16" => {
-                            let out = output.outputU16(name);
-                            let array = reinterpret_u16_to_f16(Array::from_shape_vec(shape, out).ok()?);
-                            Some((key, array.into()))
-                        }
-                        _ => {
-                            eprintln!("warning: type not one of f32 or f16, and will be skipped in the output");
-                            return None;
-                        }
+        let mut outputs = HashMap::with_capacity(self.outputs.len());
+        for (key, (ty, shape)) in &self.outputs {
+            match *ty {
+                "f32" => {
+                    let out = output.outputF32(key.clone());
+                    if let Ok(array) = Array::from_shape_vec(shape.clone(), out) {
+                        outputs.insert(key.clone(), array.into());
                     }
-                })
-                .collect(),
-        })
+                }
+                "f16" => {
+                    let out = output.outputU16(key.clone());
+                    if let Ok(array) = Array::from_shape_vec(shape.clone(), out) {
+                        outputs.insert(key.clone(), reinterpret_u16_to_f16(array).into());
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "warning: type not one of f32 or f16, and will be skipped in the output"
+                    );
+                }
+            }
+        }
+        Ok(MLModelOutput { outputs })
     }
 
     pub fn description(&self) -> HashMap<&str, Vec<String>> {
@@ -494,6 +651,52 @@ impl CoreMLModel {
         map.insert("output", desc.outputs());
         map
     }
+}
+
+/// The specification and weight blobs of an in-memory `.mlpackage`.
+pub(crate) type PackageParts = (Vec<u8>, Vec<(String, Vec<u8>)>);
+
+/// Reads `Data/com.apple.CoreML/model.mlmodel` and every `@model_path/...`
+/// weight blob it references, resolved against the package's
+/// `Data/com.apple.CoreML` directory.
+pub(crate) fn read_package(package: &Path) -> Result<PackageParts, CoreMLError> {
+    let root = package.join("Data/com.apple.CoreML");
+    let spec = std::fs::read(root.join("model.mlmodel")).map_err(CoreMLError::IoError)?;
+    let mut blobs = Vec::new();
+    for reference in model_path_references(&spec) {
+        let data = std::fs::read(root.join(&reference)).map_err(CoreMLError::IoError)?;
+        blobs.push((reference, data));
+    }
+    Ok((spec, blobs))
+}
+
+/// Collects the `@model_path/...` file references embedded in a CoreML
+/// specification. The protobuf stores them as plain strings.
+fn model_path_references(spec: &[u8]) -> Vec<String> {
+    const PREFIX: &[u8] = b"@model_path/";
+    let mut references = Vec::new();
+    let mut search_from = 0;
+    while let Some(offset) = spec[search_from..]
+        .windows(PREFIX.len())
+        .position(|window| window == PREFIX)
+    {
+        let start = search_from + offset + PREFIX.len();
+        let mut end = start;
+        while end < spec.len() && is_reference_byte(spec[end]) {
+            end += 1;
+        }
+        if end > start {
+            references.push(String::from_utf8_lossy(&spec[start..end]).into_owned());
+        }
+        search_from = end.max(start + 1);
+    }
+    references.sort();
+    references.dedup();
+    references
+}
+
+fn is_reference_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'@')
 }
 
 fn reinterpret_u16_to_f16(input: ndarray::ArrayD<u16>) -> ndarray::ArrayD<half::f16> {
@@ -520,4 +723,27 @@ fn reinterpret_u16_to_f16(input: ndarray::ArrayD<u16>) -> ndarray::ArrayD<half::
 
     // TODO SA: we know unwrap won't cause ShapeError, but avoid unwrap regardless
     ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&shape), raw_vec_f16).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_path_references;
+
+    #[test]
+    fn collects_unique_model_path_references() {
+        let mut spec = Vec::new();
+        // Two BlobFileValue entries for the same file plus unrelated bytes.
+        spec.extend_from_slice(b"\x0a\x1e@model_path/weights/weight.bin\x10\x40");
+        spec.extend_from_slice(b"\x0a\x1e@model_path/weights/weight.bin\x10\x80\x08");
+        spec.extend_from_slice(b"not/a/reference\x00");
+        assert_eq!(
+            model_path_references(&spec),
+            vec!["weights/weight.bin".to_string()]
+        );
+    }
+
+    #[test]
+    fn handles_specs_without_references() {
+        assert!(model_path_references(b"\x08\x06").is_empty());
+    }
 }

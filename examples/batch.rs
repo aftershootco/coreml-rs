@@ -4,8 +4,10 @@ use ndarray::{Array, Array4};
 pub fn main() {
     let file = std::fs::read("./demo/model_3.mlmodel").unwrap();
 
-    let mut model_options = CoreMLModelOptions::default();
-    model_options.compute_platform = ComputePlatform::CpuAndANE;
+    let model_options = CoreMLModelOptions {
+        compute_platform: ComputePlatform::CpuAndANE,
+        ..Default::default()
+    };
 
     let mut model = CoreMLBatchModelWithState::from_buf(file, model_options);
 

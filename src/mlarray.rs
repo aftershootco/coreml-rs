@@ -123,6 +123,14 @@ impl<T: MLType> From<ArrayBase<OwnedRepr<T>, Dim<IxDynImpl>>> for MLArray {
 impl MLArray {
     #[allow(clippy::missing_transmute_annotations)]
     pub fn extract_to_tensor<T: MLType>(self) -> Array<T, Dim<IxDynImpl>> {
+        // SAFETY: `MLType::TY` is unique per element type, so `T::TY == f32::TY` means `T` is
+        // `f32` and the converted array already has type `Array<T, _>`. Transmuting an f16 array
+        // straight into f32 (the fallthrough below) reinterprets its bytes, so fp16 model
+        // outputs requested as f32 are widened instead.
+        if let (true, MLArray::Float16Array(half)) = (T::TY == <f32 as MLType>::TY, &self) {
+            let widened: Array<f32, Dim<IxDynImpl>> = half.mapv(f32::from);
+            return unsafe { std::mem::transmute::<Array<f32, Dim<IxDynImpl>>, Array<T, Dim<IxDynImpl>>>(widened) };
+        }
         unsafe {
             match self {
                 MLArray::Float32Array(fm) => std::mem::transmute(fm),

@@ -28,8 +28,8 @@ use objc2::{msg_send, AnyThread, ClassType};
 use objc2_core_ml::{
     MLArrayBatchProvider, MLBatchProvider, MLComputeUnits, MLDictionaryFeatureProvider,
     MLFeatureDescription, MLFeatureProvider, MLFeatureValue, MLModel, MLModelAsset,
-    MLModelConfiguration, MLModelDescription, MLMultiArray, MLMultiArrayDataType,
-    MLPredictionOptions,
+    MLModelConfiguration, MLModelCreatorDefinedKey, MLModelDescription, MLMultiArray,
+    MLMultiArrayDataType, MLPredictionOptions,
 };
 use objc2_foundation::{
     NSArray, NSData, NSDictionary, NSError, NSNumber, NSProcessInfo, NSString, NSURL,
@@ -277,6 +277,30 @@ impl ModelDescription {
         self.description
             .as_ref()
             .map(|description| unsafe { description.outputDescriptionsByName() })
+    }
+
+    pub fn creator_metadata(&self) -> HashMap<String, String> {
+        let (Some(description), Some(key)) =
+            (self.description.as_ref(), unsafe { MLModelCreatorDefinedKey })
+        else {
+            return HashMap::new();
+        };
+        let metadata = unsafe { description.metadata() };
+        let Some(entries) = metadata
+            .objectForKey(key)
+            .and_then(|entries| entries.downcast::<NSDictionary>().ok())
+        else {
+            return HashMap::new();
+        };
+        let (keys, values) = entries.to_vecs();
+        keys.into_iter()
+            .zip(values)
+            .filter_map(|(key, value)| {
+                let key = key.downcast::<NSString>().ok()?.to_string();
+                let value = value.downcast::<NSString>().ok()?.to_string();
+                Some((key, value))
+            })
+            .collect()
     }
 
     pub fn inputs(&self) -> Vec<String> {

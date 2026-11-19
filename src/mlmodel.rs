@@ -328,6 +328,15 @@ impl CoreMLModelWithState {
         }
     }
 
+    pub fn creator_metadata(&self) -> Result<HashMap<String, String>, CoreMLError> {
+        match self {
+            CoreMLModelWithState::Unloaded(_, _) => Err(CoreMLError::ModelNotLoaded),
+            CoreMLModelWithState::Loaded(core_mlmodel, _, _) => {
+                Ok(core_mlmodel.creator_metadata())
+            }
+        }
+    }
+
     pub fn add_input(
         &mut self,
         tag: impl AsRef<str>,
@@ -646,6 +655,10 @@ impl CoreMLModel {
             }
         }
         Ok(MLModelOutput { outputs })
+    }
+
+    pub fn creator_metadata(&self) -> HashMap<String, String> {
+        self.model.description().creator_metadata()
     }
 
     pub fn description(&self) -> HashMap<&str, Vec<String>> {

@@ -284,7 +284,8 @@ impl std::fmt::Debug for BatchModel {
 impl CoreMLBatchModel {
     pub fn load_from_path(path: String, info: CoreMLModelInfo, compiled: bool) -> Self {
         Self {
-            model: modelWithPathBatch(path, info.opts.compute_platform, compiled),
+            model: modelWithPathBatch(path, info.opts.compute_platform, compiled)
+                .with_function_name(info.opts.function_name),
             // save_path: None,
             outputs: Default::default(),
             input_shapes: Default::default(),
@@ -302,7 +303,8 @@ impl CoreMLBatchModel {
                 buf.as_mut_ptr(),
                 buf.len() as isize,
                 info.opts.compute_platform,
-            ),
+            )
+            .with_function_name(info.opts.function_name),
             // save_path: None,
             outputs: Default::default(),
             input_shapes: Default::default(),
@@ -319,7 +321,8 @@ impl CoreMLBatchModel {
         info: CoreMLModelInfo,
     ) -> Self {
         Self {
-            model: modelWithPackageBatch(spec, blobs, info.opts.compute_platform),
+            model: modelWithPackageBatch(spec, blobs, info.opts.compute_platform)
+                .with_function_name(info.opts.function_name),
             // save_path: None,
             outputs: Default::default(),
             input_shapes: Default::default(),

@@ -375,6 +375,7 @@ pub struct Model {
     inputs: HashMap<String, Retained<MLFeatureValue>>,
     outputs: HashMap<String, (Retained<MLMultiArray>, BackingBuffer)>,
     compute_units: MLComputeUnits,
+    function_name: Option<String>,
     /// Set when CoreML rejects output backings (dynamically-shaped outputs),
     /// after which predictions copy their outputs out instead.
     backings_unsupported: bool,
@@ -387,6 +388,11 @@ pub struct Model {
 unsafe impl Send for Model {}
 
 impl Model {
+    pub fn with_function_name(mut self, function_name: Option<String>) -> Self {
+        self.function_name = function_name;
+        self
+    }
+
     fn empty(compute: ComputePlatform) -> Self {
         Self {
             compiled_path: None,
@@ -396,6 +402,7 @@ impl Model {
             inputs: HashMap::new(),
             outputs: HashMap::new(),
             compute_units: compute.compute_units(),
+            function_name: None,
             backings_unsupported: false,
             failed_to_load: false,
         }
@@ -453,7 +460,7 @@ impl Model {
         if self.model.is_some() {
             return true;
         }
-        let config = model_configuration(self.compute_units);
+        let config = model_configuration(self.compute_units, self.function_name.as_deref());
         if let Some(path) = &self.compiled_path {
             let url = file_url(path);
             return match unsafe {
@@ -776,6 +783,7 @@ pub struct BatchModel {
     model: Option<Retained<MLModel>>,
     inputs: Vec<HashMap<String, Retained<MLFeatureValue>>>,
     compute_units: MLComputeUnits,
+    function_name: Option<String>,
     failed_to_load: bool,
 }
 
@@ -783,6 +791,11 @@ pub struct BatchModel {
 unsafe impl Send for BatchModel {}
 
 impl BatchModel {
+    pub fn with_function_name(mut self, function_name: Option<String>) -> Self {
+        self.function_name = function_name;
+        self
+    }
+
     fn empty(compute: ComputePlatform) -> Self {
         Self {
             compiled_path: None,
@@ -791,6 +804,7 @@ impl BatchModel {
             model: None,
             inputs: Vec::new(),
             compute_units: compute.compute_units(),
+            function_name: None,
             failed_to_load: false,
         }
     }
@@ -840,7 +854,7 @@ impl BatchModel {
         if self.model.is_some() {
             return true;
         }
-        let config = model_configuration(self.compute_units);
+        let config = model_configuration(self.compute_units, self.function_name.as_deref());
         if let Some(path) = &self.compiled_path {
             let url = file_url(path);
             return match unsafe {
@@ -1254,9 +1268,15 @@ fn unique_sibling(path: &Path, tag: &str) -> PathBuf {
 /// set: it trades a ~4x slower model load for a faster prediction engine, and
 /// the single-model path never used it. If a workload wants that trade, set the
 /// key here again.
-fn model_configuration(compute_units: MLComputeUnits) -> Retained<MLModelConfiguration> {
+fn model_configuration(
+    compute_units: MLComputeUnits,
+    function_name: Option<&str>,
+) -> Retained<MLModelConfiguration> {
     let config = unsafe { MLModelConfiguration::new() };
     unsafe { config.setComputeUnits(compute_units) };
+    if let Some(name) = function_name {
+        unsafe { config.setFunctionName(Some(&NSString::from_str(name))) };
+    }
     config
 }
 

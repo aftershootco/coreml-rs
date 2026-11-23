@@ -1,18 +1,11 @@
 use crate::{
     ffi::MLBatchModelOutput,
-    ffi::{modelWithAssetsBatch, modelWithPackageBatch, modelWithPathBatch, BatchModel},
+    ffi::{modelWithPathBatch, BatchModel, LoadError},
     mlarray::MLArray,
-    mlmodel::{read_package, CoreMLError, CoreMLModelInfo, CoreMLModelLoader, OutputSpec},
+    mlmodel::{CoreMLError, CoreMLModelInfo, CoreMLModelLoader, TensorInfo},
     CoreMLModelOptions,
 };
-use flate2::Compression;
-use ndarray::Array;
-use std::{
-    collections::HashMap,
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
-use tempfile::NamedTempFile;
+use std::path::Path;
 
 pub use crate::ffi::MLModelOutput;
 
@@ -25,219 +18,65 @@ pub enum CoreMLBatchModelWithState {
 }
 
 impl CoreMLBatchModelWithState {
-    pub fn new(path: impl AsRef<Path>, opts: CoreMLModelOptions) -> Self {
-        Self::Unloaded(
-            CoreMLModelInfo { opts },
-            CoreMLModelLoader::ModelPath(path.as_ref().to_path_buf()),
-        )
-    }
+    /// Creates an unloaded batch model from a caller-owned `.mlmodelc` directory.
     pub fn new_compiled(path: impl AsRef<Path>, opts: CoreMLModelOptions) -> Self {
         Self::Unloaded(
             CoreMLModelInfo { opts },
-            CoreMLModelLoader::CompiledPath(path.as_ref().to_path_buf()),
+            CoreMLModelLoader {
+                path: path.as_ref().to_path_buf(),
+            },
         )
-    }
-
-    pub fn from_buf(buf: Vec<u8>, opts: CoreMLModelOptions) -> Self {
-        Self::Unloaded(CoreMLModelInfo { opts }, CoreMLModelLoader::Buffer(buf))
-    }
-
-    /// Builds a batch model from an in-memory `.mlpackage` specification and
-    /// its weight blobs. Requires macOS 15 or newer; see
-    /// [`crate::mlmodel::CoreMLModelWithState::from_package`].
-    pub fn from_package(
-        spec: Vec<u8>,
-        blobs: Vec<(String, Vec<u8>)>,
-        opts: CoreMLModelOptions,
-    ) -> Self {
-        Self::Unloaded(
-            CoreMLModelInfo { opts },
-            CoreMLModelLoader::Package { spec, blobs },
-        )
-    }
-
-    /// Reads a `.mlpackage` directory into memory for batch prediction.
-    /// Requires macOS 15 or newer.
-    pub fn from_package_dir(
-        package: impl AsRef<Path>,
-        opts: CoreMLModelOptions,
-    ) -> Result<Self, CoreMLError> {
-        let (spec, blobs) = read_package(package.as_ref())?;
-        Ok(Self::from_package(spec, blobs, opts))
     }
 
     pub fn load(self) -> Result<Self, CoreMLError> {
         let Self::Unloaded(info, loader) = self else {
             return Ok(self);
         };
-        match loader {
-            CoreMLModelLoader::ModelPath(path_buf) => {
-                let mut coreml_model = CoreMLBatchModel::load_from_path(
-                    path_buf.display().to_string(),
-                    info.clone(),
-                    false,
-                );
-                coreml_model.model.load();
-                let loader = CoreMLModelLoader::ModelPath(path_buf);
-                if coreml_model.model.failed() {
-                    return Err(CoreMLError::FailedToLoadBatchStatic(
-                        "Failed to load model; likely not a CoreML model file",
-                        Self::Unloaded(info, loader),
-                    ));
-                }
-                Ok(Self::Loaded(coreml_model, info, loader))
-            }
-            CoreMLModelLoader::CompiledPath(path_buf) => {
-                let mut coreml_model = CoreMLBatchModel::load_from_path(
-                    path_buf.display().to_string(),
-                    info.clone(),
-                    true,
-                );
-                coreml_model.model.load();
-                let loader = CoreMLModelLoader::CompiledPath(path_buf);
-                if coreml_model.model.failed() {
-                    return Err(CoreMLError::FailedToLoadBatchStatic(
-                        "Failed to load model; likely not a CoreML model file",
-                        Self::Unloaded(info, loader),
-                    ));
-                }
-                Ok(Self::Loaded(coreml_model, info, loader))
-            }
-            CoreMLModelLoader::Buffer(vec) => {
-                let mut coreml_model = CoreMLBatchModel::load_buffer(vec.clone(), info.clone());
-                coreml_model.model.load();
-                if coreml_model.model.failed() {
-                    return Err(CoreMLError::FailedToLoadBatchStatic(
-                        "Failed to load model; likely not a CoreML mlmodel file",
-                        Self::Unloaded(info, CoreMLModelLoader::Buffer(vec)),
-                    ));
-                }
-                let loader = CoreMLModelLoader::Buffer(vec);
-                Ok(Self::Loaded(coreml_model, info, loader))
-            }
-            CoreMLModelLoader::Package { spec, blobs } => {
-                let mut coreml_model =
-                    CoreMLBatchModel::load_package(spec.clone(), blobs.clone(), info.clone());
-                coreml_model.model.load();
-                if coreml_model.model.failed() {
-                    return Err(CoreMLError::FailedToLoadBatchStatic(
-                        "Failed to load in-memory model package; needs macOS 15+ and every weight blob",
-                        Self::Unloaded(info, CoreMLModelLoader::Package { spec, blobs }),
-                    ));
-                }
-                Ok(Self::Loaded(
-                    coreml_model,
-                    info,
-                    CoreMLModelLoader::Package { spec, blobs },
-                ))
-            }
-            CoreMLModelLoader::BufferToDisk(u) => {
-                match std::fs::File::open(&u)
-                    .map_err(CoreMLError::IoError)
-                    .and_then(|file| {
-                        let mut vec = vec![];
-                        _ = flate2::read::ZlibDecoder::new(file)
-                            .read_to_end(&mut vec)
-                            .map_err(CoreMLError::IoError)?;
-                        Ok(vec)
-                    }) {
-                    Ok(vec) => {
-                        let mut coreml_model = CoreMLBatchModel::load_buffer(vec, info.clone());
-                        coreml_model.model.load();
-                        let loader = CoreMLModelLoader::BufferToDisk(u);
-                        Ok(Self::Loaded(coreml_model, info, loader))
-                    }
-                    Err(err) => Err(CoreMLError::FailedToBatchLoad(
-                        format!("failed to load the model from cached buffer path: {err}"),
-                        CoreMLBatchModelWithState::Unloaded(
-                            info,
-                            CoreMLModelLoader::BufferToDisk(u),
-                        ),
-                    )),
-                }
-            }
+        let mut model = CoreMLBatchModel::load_compiled(&loader.path, &info);
+        match model.model.load() {
+            Ok(()) => Ok(Self::Loaded(model, info, loader)),
+            Err(LoadError::Native {
+                domain,
+                code,
+                message,
+            }) => Err(CoreMLError::NativeBatch {
+                domain,
+                code,
+                message,
+                model: Self::Unloaded(info, loader),
+            }),
+            Err(error) => Err(CoreMLError::FailedToBatchLoad(
+                error.to_string(),
+                Self::Unloaded(info, loader),
+            )),
         }
     }
 
-    /// Might fail if system disk space too low(very unlikely)
+    /// Releases the loaded model without modifying its caller-owned bundle.
     pub fn unload(self) -> Result<Self, CoreMLError> {
-        if let Self::Loaded(model, info, loader) = self {
-            Ok(Self::Unloaded(
-                info,
-                match loader {
-                    CoreMLModelLoader::Buffer(v) => {
-                        let mut temp_file = NamedTempFile::new().map_err(CoreMLError::IoError)?;
-                        temp_file.write_all(&v).map_err(CoreMLError::IoError)?;
-                        CoreMLModelLoader::Buffer(
-                            std::fs::read(temp_file.path()).map_err(CoreMLError::IoError)?,
-                        )
-                    }
-                    // Mirror the single-model path: after a path load the model
-                    // has a compiled copy, so reloading can skip compilation.
-                    CoreMLModelLoader::ModelPath(path) => match model.model.compiled_path() {
-                        Some(compiled) => CoreMLModelLoader::CompiledPath(compiled.into()),
-                        None => CoreMLModelLoader::ModelPath(path),
-                    },
-                    loader => loader,
-                },
-            ))
-        } else {
-            Ok(self)
+        match self {
+            Self::Loaded(_, info, loader) => Ok(Self::Unloaded(info, loader)),
+            unloaded => Ok(unloaded),
         }
     }
 
-    /// Unloads the model buffer to the disk, at cache_dir
-    pub fn unload_to_disk(self) -> Result<Self, CoreMLError> {
+    pub fn inputs_info(&mut self) -> Result<&[TensorInfo], CoreMLError> {
         match self {
-            Self::Loaded(_, mut info, loader) | Self::Unloaded(mut info, loader) => {
-                let loader = {
-                    match loader {
-                        CoreMLModelLoader::Buffer(vec) => {
-                            if info.opts.cache_dir.as_os_str().is_empty() {
-                                info.opts.cache_dir = PathBuf::from(".");
-                            }
-                            if !info.opts.cache_dir.exists() {
-                                _ = std::fs::remove_dir_all(&info.opts.cache_dir);
-                                _ = std::fs::create_dir_all(&info.opts.cache_dir);
-                            }
-                            // pick the file specified, if it's a folder/dir append model_cache
-                            let m = if !info.opts.cache_dir.is_dir() {
-                                info.opts.cache_dir.clone()
-                            } else {
-                                info.opts.cache_dir.join("model_cache")
-                            };
-                            match std::fs::File::create(&m).map_err(CoreMLError::IoError).map(
-                                |file| {
-                                    flate2::write::ZlibEncoder::new(file, Compression::best())
-                                        .write_all(&vec)
-                                        .map_err(CoreMLError::IoError)
-                                },
-                            ) {
-                                Ok(_) => {}
-                                Err(err) => {
-                                    return Err(CoreMLError::FailedToBatchLoad(
-                                        format!("failed to load the model from the buffer: {err}"),
-                                        CoreMLBatchModelWithState::Unloaded(
-                                            info,
-                                            CoreMLModelLoader::Buffer(vec),
-                                        ),
-                                    ));
-                                }
-                            };
-                            CoreMLModelLoader::BufferToDisk(m)
-                        }
-                        loader => loader,
-                    }
-                };
-                Ok(Self::Unloaded(info, loader))
-            }
+            Self::Unloaded(_, _) => Err(CoreMLError::ModelNotLoaded),
+            Self::Loaded(model, _, _) => model.inputs_info(),
         }
     }
 
-    pub fn description(&self) -> Result<HashMap<&str, Vec<String>>, CoreMLError> {
+    pub fn outputs_info(&mut self) -> Result<&[TensorInfo], CoreMLError> {
         match self {
-            CoreMLBatchModelWithState::Unloaded(_, _) => Err(CoreMLError::ModelNotLoaded),
-            CoreMLBatchModelWithState::Loaded(core_mlmodel, _, _) => Ok(core_mlmodel.description()),
+            Self::Unloaded(_, _) => Err(CoreMLError::ModelNotLoaded),
+            Self::Loaded(model, _, _) => model.outputs_info(),
+        }
+    }
+
+    pub fn clear_request(&mut self) {
+        if let Self::Loaded(model, _, _) = self {
+            model.clear_request();
         }
     }
 
@@ -266,11 +105,6 @@ impl CoreMLBatchModelWithState {
 #[derive(Debug)]
 pub struct CoreMLBatchModel {
     model: BatchModel,
-    // save_path: Option<PathBuf>,
-    outputs: HashMap<String, (&'static str, Vec<usize>)>,
-    input_shapes: HashMap<String, Vec<usize>>,
-    output_specs: Vec<OutputSpec>,
-    described: bool,
 }
 
 unsafe impl Send for CoreMLBatchModel {}
@@ -282,81 +116,24 @@ impl std::fmt::Debug for BatchModel {
 }
 
 impl CoreMLBatchModel {
-    pub fn load_from_path(path: String, info: CoreMLModelInfo, compiled: bool) -> Self {
+    pub fn load_compiled(path: impl AsRef<Path>, info: &CoreMLModelInfo) -> Self {
         Self {
-            model: modelWithPathBatch(path, info.opts.compute_platform, compiled),
-            // save_path: None,
-            outputs: Default::default(),
-            input_shapes: Default::default(),
-            output_specs: Default::default(),
-            described: false,
+            model: modelWithPathBatch(path, info.opts.compute_platform),
         }
     }
 
-    pub fn load_buffer(mut buf: Vec<u8>, info: CoreMLModelInfo) -> Self {
-        // `modelWithAssetsBatch` reconstructs the `Vec` from pointer, length and
-        // capacity, so ensure the length is the capacity first.
-        buf.shrink_to_fit();
-        let coreml_model = Self {
-            model: modelWithAssetsBatch(
-                buf.as_mut_ptr(),
-                buf.len() as isize,
-                info.opts.compute_platform,
-            ),
-            // save_path: None,
-            outputs: Default::default(),
-            input_shapes: Default::default(),
-            output_specs: Default::default(),
-            described: false,
-        };
-        std::mem::forget(buf);
-        coreml_model
+    pub fn inputs_info(&mut self) -> Result<&[TensorInfo], CoreMLError> {
+        self.model.inputs_info().map_err(CoreMLError::InvalidInput)
     }
 
-    pub fn load_package(
-        spec: Vec<u8>,
-        blobs: Vec<(String, Vec<u8>)>,
-        info: CoreMLModelInfo,
-    ) -> Self {
-        Self {
-            model: modelWithPackageBatch(spec, blobs, info.opts.compute_platform),
-            // save_path: None,
-            outputs: Default::default(),
-            input_shapes: Default::default(),
-            output_specs: Default::default(),
-            described: false,
-        }
+    pub fn outputs_info(&mut self) -> Result<&[TensorInfo], CoreMLError> {
+        self.model
+            .outputs_info()
+            .map_err(CoreMLError::InvalidOutput)
     }
 
-    /// Reads the feature metadata once, after the model is loaded, so the
-    /// prediction path stays off CoreML's description dictionaries.
-    fn ensure_described(&mut self) {
-        if self.described {
-            return;
-        }
-        let description = self.model.description();
-        self.input_shapes = description
-            .input_names()
-            .into_iter()
-            .map(|name| {
-                let shape = description.input_shape(name.clone());
-                (name, shape)
-            })
-            .collect();
-        self.output_specs = description
-            .output_names()
-            .into_iter()
-            .map(|name| {
-                let dtype = match description.output_type(name.clone()).as_str() {
-                    "f32" => "f32",
-                    "f16" => "f16",
-                    _ => "",
-                };
-                let shape = description.output_shape(name.clone());
-                OutputSpec { name, dtype, shape }
-            })
-            .collect();
-        self.described = true;
+    pub fn clear_request(&mut self) {
+        self.model.clear_request();
     }
 
     pub fn add_input(
@@ -365,94 +142,35 @@ impl CoreMLBatchModel {
         input: impl Into<MLArray>,
         idx: isize,
     ) -> Result<(), CoreMLError> {
-        // route input correctly
-        let input: MLArray = input.into();
-        let name = tag.as_ref().to_string();
-        let shape: Vec<usize> = input.shape().to_vec();
-        self.ensure_described();
-        let arr = self.input_shapes.get(&name).cloned().unwrap_or_default();
-        if arr.len() != shape.len() || !arr.iter().eq(shape.iter()) {
-            if arr.is_empty() {
-                return Err(CoreMLError::BadInputShape(format!(
-                    "Input feature name '{name}' not expected!"
-                )));
-            }
-            return Err(CoreMLError::BadInputShape(format!(
-                "expected shape {arr:?} found {shape:?}"
-            )));
-        }
-        match input {
-            MLArray::Float32Array(array_base) => {
-                let (mut data, offset) = array_base.into_raw_vec_and_offset();
-                assert!(
-                    matches!(offset, Some(0) | None),
-                    "array base offset is not zero; bad aligned input"
-                );
-                if !self
-                    .model
-                    .bindInputF32(shape, name, data.as_mut_ptr(), data.capacity(), idx)
-                {
-                    return Err(CoreMLError::UnknownErrorStatic(
-                        "failed to bind input to model",
-                    ));
-                }
-                std::mem::forget(data);
-            }
-            _ => {
-                return Err(CoreMLError::UnknownErrorStatic(
-                    "failed to bind input to model",
-                ));
-            }
-        }
-        Ok(())
+        self.model
+            .bind_input(tag.as_ref(), input.into(), idx)
+            .map_err(CoreMLError::InvalidInput)
     }
 
     pub fn predict(&mut self) -> Result<MLBatchModelOutput, CoreMLError> {
-        self.ensure_described();
-        for spec in &self.output_specs {
-            match spec.dtype {
-                "f32" => {
-                    self.outputs
-                        .insert(spec.name.clone(), ("f32", spec.shape.clone()));
-                }
-                _ => {
-                    return Err(CoreMLError::UnknownErrorStatic(
-                        "non-f32 output types are not supported (yet)!",
-                    ))
-                }
-            }
-        }
-
         let output = self.model.predict();
-        if let Some(err) = output.getError() {
-            return Err(CoreMLError::UnknownError(err));
+        if let Some(error) = output.getError() {
+            return Err(CoreMLError::InvalidOutput(error));
         }
-        let mut outputs = Vec::with_capacity(output.count().max(0) as usize);
-        for index in 0..output.count() {
-            let mut prediction = output.for_idx(index);
-            let mut values = HashMap::with_capacity(self.outputs.len());
-            for (key, (ty, shape)) in &self.outputs {
-                if *ty != "f32" {
-                    eprintln!(
-                        "warning: non-f32 types aren't supported, and will be skipped in the output"
-                    );
-                    continue;
-                }
-                let out = prediction.outputF32(key.clone());
-                if let Ok(array) = Array::from_shape_vec(shape.clone(), out) {
-                    values.insert(key.clone(), array.into());
-                }
-            }
-            outputs.push(values);
+        let specs = self
+            .model
+            .outputs_info()
+            .map_err(CoreMLError::InvalidOutput)?;
+        let count = output.count();
+        if count < 0 {
+            return Err(CoreMLError::InvalidOutput(
+                "negative batch output count".into(),
+            ));
+        }
+        let mut outputs = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            outputs.push(
+                output
+                    .for_idx(index)
+                    .into_outputs(specs)
+                    .map_err(CoreMLError::InvalidOutput)?,
+            );
         }
         Ok(MLBatchModelOutput { outputs })
-    }
-
-    pub fn description(&self) -> HashMap<&str, Vec<String>> {
-        let desc = self.model.description();
-        let mut map = HashMap::new();
-        map.insert("input", desc.inputs());
-        map.insert("output", desc.outputs());
-        map
     }
 }

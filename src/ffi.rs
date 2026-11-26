@@ -23,8 +23,8 @@ use std::time::Instant;
 
 use block2::{DynBlock, RcBlock};
 use objc2::rc::{autoreleasepool, Retained};
-use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{msg_send, AnyThread, ClassType};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::{msg_send, sel, AnyThread, ClassType};
 use objc2_core_ml::{
     MLArrayBatchProvider, MLBatchProvider, MLComputeUnits, MLDictionaryFeatureProvider,
     MLFeatureDescription, MLFeatureProvider, MLFeatureValue, MLModel, MLModelAsset,
@@ -484,7 +484,11 @@ impl Model {
         if self.model.is_some() {
             return true;
         }
-        let config = model_configuration(self.compute_units, self.function_name.as_deref());
+        let Some(config) = model_configuration(self.compute_units, self.function_name.as_deref())
+        else {
+            log("MLModelConfiguration.functionName needs macOS 15 or later");
+            return false;
+        };
         if let Some(path) = &self.compiled_path {
             let url = file_url(path);
             return match unsafe {
@@ -878,7 +882,11 @@ impl BatchModel {
         if self.model.is_some() {
             return true;
         }
-        let config = model_configuration(self.compute_units, self.function_name.as_deref());
+        let Some(config) = model_configuration(self.compute_units, self.function_name.as_deref())
+        else {
+            log("MLModelConfiguration.functionName needs macOS 15 or later");
+            return false;
+        };
         if let Some(path) = &self.compiled_path {
             let url = file_url(path);
             return match unsafe {
@@ -1295,13 +1303,16 @@ fn unique_sibling(path: &Path, tag: &str) -> PathBuf {
 fn model_configuration(
     compute_units: MLComputeUnits,
     function_name: Option<&str>,
-) -> Retained<MLModelConfiguration> {
+) -> Option<Retained<MLModelConfiguration>> {
     let config = unsafe { MLModelConfiguration::new() };
     unsafe { config.setComputeUnits(compute_units) };
     if let Some(name) = function_name {
+        if !config.respondsToSelector(sel!(setFunctionName:)) {
+            return None;
+        }
         unsafe { config.setFunctionName(Some(&NSString::from_str(name))) };
     }
-    config
+    Some(config)
 }
 
 /// Loads an `MLModelAsset` through the asynchronous API and blocks until it

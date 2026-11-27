@@ -45,6 +45,7 @@ pub enum CoreMLError {
 pub struct CoreMLModelOptions {
     pub compute_platform: ComputePlatform,
     pub cache_dir: PathBuf,
+    pub function_name: Option<String>,
 }
 
 impl std::fmt::Debug for CoreMLModelOptions {
@@ -327,6 +328,15 @@ impl CoreMLModelWithState {
         }
     }
 
+    pub fn creator_metadata(&self) -> Result<HashMap<String, String>, CoreMLError> {
+        match self {
+            CoreMLModelWithState::Unloaded(_, _) => Err(CoreMLError::ModelNotLoaded),
+            CoreMLModelWithState::Loaded(core_mlmodel, _, _) => {
+                Ok(core_mlmodel.creator_metadata())
+            }
+        }
+    }
+
     pub fn add_input(
         &mut self,
         tag: impl AsRef<str>,
@@ -381,7 +391,8 @@ impl std::fmt::Debug for Model {
 impl CoreMLModel {
     pub fn load_from_path(path: String, info: CoreMLModelInfo, compiled: bool) -> Self {
         Self {
-            model: modelWithPath(path, info.opts.compute_platform, compiled),
+            model: modelWithPath(path, info.opts.compute_platform, compiled)
+                .with_function_name(info.opts.function_name),
             outputs: Default::default(),
             input_shapes: Default::default(),
             output_specs: Default::default(),
@@ -398,7 +409,8 @@ impl CoreMLModel {
                 buf.as_mut_ptr(),
                 buf.len() as isize,
                 info.opts.compute_platform,
-            ),
+            )
+            .with_function_name(info.opts.function_name),
             outputs: Default::default(),
             input_shapes: Default::default(),
             output_specs: Default::default(),
@@ -414,7 +426,8 @@ impl CoreMLModel {
         info: CoreMLModelInfo,
     ) -> Self {
         Self {
-            model: modelWithPackage(spec, blobs, info.opts.compute_platform),
+            model: modelWithPackage(spec, blobs, info.opts.compute_platform)
+                .with_function_name(info.opts.function_name),
             outputs: Default::default(),
             input_shapes: Default::default(),
             output_specs: Default::default(),
@@ -642,6 +655,10 @@ impl CoreMLModel {
             }
         }
         Ok(MLModelOutput { outputs })
+    }
+
+    pub fn creator_metadata(&self) -> HashMap<String, String> {
+        self.model.description().creator_metadata()
     }
 
     pub fn description(&self) -> HashMap<&str, Vec<String>> {

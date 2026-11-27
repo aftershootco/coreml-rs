@@ -23,13 +23,13 @@ use std::time::Instant;
 
 use block2::{DynBlock, RcBlock};
 use objc2::rc::{autoreleasepool, Retained};
-use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{msg_send, AnyThread, ClassType};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::{msg_send, sel, AnyThread, ClassType};
 use objc2_core_ml::{
     MLArrayBatchProvider, MLBatchProvider, MLComputeUnits, MLDictionaryFeatureProvider,
     MLFeatureDescription, MLFeatureProvider, MLFeatureValue, MLModel, MLModelAsset,
-    MLModelConfiguration, MLModelDescription, MLMultiArray, MLMultiArrayDataType,
-    MLPredictionOptions,
+    MLModelConfiguration, MLModelCreatorDefinedKey, MLModelDescription, MLMultiArray,
+    MLMultiArrayDataType, MLPredictionOptions,
 };
 use objc2_foundation::{
     NSArray, NSData, NSDictionary, NSError, NSNumber, NSProcessInfo, NSString, NSURL,
@@ -279,6 +279,30 @@ impl ModelDescription {
             .map(|description| unsafe { description.outputDescriptionsByName() })
     }
 
+    pub fn creator_metadata(&self) -> HashMap<String, String> {
+        let (Some(description), Some(key)) =
+            (self.description.as_ref(), unsafe { MLModelCreatorDefinedKey })
+        else {
+            return HashMap::new();
+        };
+        let metadata = unsafe { description.metadata() };
+        let Some(entries) = metadata
+            .objectForKey(key)
+            .and_then(|entries| entries.downcast::<NSDictionary>().ok())
+        else {
+            return HashMap::new();
+        };
+        let (keys, values) = entries.to_vecs();
+        keys.into_iter()
+            .zip(values)
+            .filter_map(|(key, value)| {
+                let key = key.downcast::<NSString>().ok()?.to_string();
+                let value = value.downcast::<NSString>().ok()?.to_string();
+                Some((key, value))
+            })
+            .collect()
+    }
+
     pub fn inputs(&self) -> Vec<String> {
         self.inputs_by_name()
             .map(|descriptions| {
@@ -375,6 +399,7 @@ pub struct Model {
     inputs: HashMap<String, Retained<MLFeatureValue>>,
     outputs: HashMap<String, (Retained<MLMultiArray>, BackingBuffer)>,
     compute_units: MLComputeUnits,
+    function_name: Option<String>,
     /// Set when CoreML rejects output backings (dynamically-shaped outputs),
     /// after which predictions copy their outputs out instead.
     backings_unsupported: bool,
@@ -387,6 +412,11 @@ pub struct Model {
 unsafe impl Send for Model {}
 
 impl Model {
+    pub fn with_function_name(mut self, function_name: Option<String>) -> Self {
+        self.function_name = function_name;
+        self
+    }
+
     fn empty(compute: ComputePlatform) -> Self {
         Self {
             compiled_path: None,
@@ -396,6 +426,7 @@ impl Model {
             inputs: HashMap::new(),
             outputs: HashMap::new(),
             compute_units: compute.compute_units(),
+            function_name: None,
             backings_unsupported: false,
             failed_to_load: false,
         }
@@ -453,7 +484,11 @@ impl Model {
         if self.model.is_some() {
             return true;
         }
-        let config = model_configuration(self.compute_units);
+        let Some(config) = model_configuration(self.compute_units, self.function_name.as_deref())
+        else {
+            log("MLModelConfiguration.functionName needs macOS 15 or later");
+            return false;
+        };
         if let Some(path) = &self.compiled_path {
             let url = file_url(path);
             return match unsafe {
@@ -776,6 +811,7 @@ pub struct BatchModel {
     model: Option<Retained<MLModel>>,
     inputs: Vec<HashMap<String, Retained<MLFeatureValue>>>,
     compute_units: MLComputeUnits,
+    function_name: Option<String>,
     failed_to_load: bool,
 }
 
@@ -783,6 +819,11 @@ pub struct BatchModel {
 unsafe impl Send for BatchModel {}
 
 impl BatchModel {
+    pub fn with_function_name(mut self, function_name: Option<String>) -> Self {
+        self.function_name = function_name;
+        self
+    }
+
     fn empty(compute: ComputePlatform) -> Self {
         Self {
             compiled_path: None,
@@ -791,6 +832,7 @@ impl BatchModel {
             model: None,
             inputs: Vec::new(),
             compute_units: compute.compute_units(),
+            function_name: None,
             failed_to_load: false,
         }
     }
@@ -840,7 +882,11 @@ impl BatchModel {
         if self.model.is_some() {
             return true;
         }
-        let config = model_configuration(self.compute_units);
+        let Some(config) = model_configuration(self.compute_units, self.function_name.as_deref())
+        else {
+            log("MLModelConfiguration.functionName needs macOS 15 or later");
+            return false;
+        };
         if let Some(path) = &self.compiled_path {
             let url = file_url(path);
             return match unsafe {
@@ -1254,10 +1300,19 @@ fn unique_sibling(path: &Path, tag: &str) -> PathBuf {
 /// set: it trades a ~4x slower model load for a faster prediction engine, and
 /// the single-model path never used it. If a workload wants that trade, set the
 /// key here again.
-fn model_configuration(compute_units: MLComputeUnits) -> Retained<MLModelConfiguration> {
+fn model_configuration(
+    compute_units: MLComputeUnits,
+    function_name: Option<&str>,
+) -> Option<Retained<MLModelConfiguration>> {
     let config = unsafe { MLModelConfiguration::new() };
     unsafe { config.setComputeUnits(compute_units) };
-    config
+    if let Some(name) = function_name {
+        if !config.respondsToSelector(sel!(setFunctionName:)) {
+            return None;
+        }
+        unsafe { config.setFunctionName(Some(&NSString::from_str(name))) };
+    }
+    Some(config)
 }
 
 /// Loads an `MLModelAsset` through the asynchronous API and blocks until it
